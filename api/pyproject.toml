@@ -1,0 +1,100 @@
+[tool.poetry]
+name = "hedge_bot"
+version = "0.1.0"
+description = ""
+authors = ["rando128 <stephane.honore@gmail.com>"]
+license = "Proprietary"
+
+packages = [
+    {include = "hedge_bot"},
+]
+
+[tool.poetry.dependencies]
+python = "~3.13"
+modelw-preset-django = {extras = ["psycopg", "health", "procrastinate", "channels"], version = ">=2025.10.0,<2025.11.0"}
+drf-spectacular = {extras = ["sidecar"], version = "*"}
+# Health check modules
+markdown = "*"
+networkx = "*"
+
+[tool.poetry.group.dev.dependencies]
+black = "*"
+isort = "*"
+ipython = "*"
+django-extensions = "*"
+django-debug-toolbar = "*"
+ruff = "*"
+
+[tool.poetry.group.test.dependencies]
+node-edge = {version = "^0.1.0b6", allow-prereleases = true}
+psutil = "*"
+pytest = "*"
+pytest-bdd = "^7.0.0"
+pytest-django = "*"
+pytest-html = "*"
+pytest-playwright = "*"
+pyyaml = "*"
+pixelmatch = "*"
+pillow = "*"
+
+[tool.isort]
+profile = "black"
+known_first_party = "hedge_bot"
+
+[tool.pytest.ini_options]
+DJANGO_SETTINGS_MODULE = "hedge_bot.django.settings"
+python_files = ["test_*.py", "*_test.py"]
+django_debug_mode = "keep"
+log_cli = true
+log_file = "bdd/report/results/test.log"
+addopts = ["--output", "bdd/report/results/media", "--screenshot", "on", "--full-page-screenshot", "--video", "on", "--tracing", "retain-on-failure", "--cucumberjson=bdd/report/results/report.json", "--html=bdd/report/results/pytest.html"]
+
+[tool.ruff]
+target-version = "py312"
+
+[tool.ruff.lint.per-file-ignores]
+"**/bdd/**" = ["ARG001", "S101"]
+"test_*.py" = ["ARG001", "S101"]
+
+[tool.ruff.lint.pydocstyle]
+convention = "pep257"
+
+[tool.ruff.lint]
+select = [
+    # -- Core --
+    "E",  # pycodestyle (errors)
+    "W",  # pycodestyle (warnings)
+    "F",  # Pyflakes
+    "I",  # isort
+    "C90",  # McCabe Complexity
+    "D1",  # Mandatory docstrings
+    "S",  # Bandit
+
+    # -- Bonus --
+    "A",  # flake8-bugbear
+    "B",  # flake8-bugbear
+    "DTZ",  # date/time zone
+    "T10",  # debugger
+    "EM",  # error messages
+    "EXE",  # executable
+    "G",  # logging
+    "UP",  # pyupgrade
+    "ASYNC",  # async
+    "INP",  # PEP 420
+    "T20",  # no print
+    "PT",  # pytest
+    "SLOT",  # slots
+    "TCH",  # type checking blocks
+    "PTH",  # Use pathlib
+    "FIX",  # Don't allow not done stuff in code
+    "ERA",  # Don't comment code
+    "RUF",  # Ruff stuff
+    "TID251",  # Banned imports (See below)
+]
+
+[tool.ruff.lint.flake8-tidy-imports.banned-api]
+"requests".msg = "Use `httpx` instead, which has timeouts by default."
+
+[build-system]
+requires = ["poetry-core>=1.0.0"]
+build-backend = "poetry.core.masonry.api"

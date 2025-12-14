@@ -1,0 +1,45 @@
+{
+    "name": "hedge_bot",
+    "version": "0.0.1",
+    "private": true,
+    "type": "module",
+    "scripts": {
+        "dev": "vite dev --port 3000 --host",
+        "build": "svelte-kit sync && vite build",
+        "preview": "vite preview --port 3000  --host",
+        "check": "svelte-kit sync && svelte-check --tsconfig ./tsconfig.json",
+        "check:watch": "svelte-kit sync && svelte-check --tsconfig ./tsconfig.json --watch",
+        "test": "vitest",
+        "lint": "prettier --check . && eslint .",
+        "format": "prettier --write ."
+    },
+    "dependencies": {
+        "@fullerstack/nax-ipware": "^0.10.0",
+        "@model-w/preset-sveltekit": "~2025.10.0",
+        "@sentry/sveltekit": "*"
+    },
+    "devDependencies": {
+        "@sveltejs/adapter-node": "*",
+        "@sveltejs/kit": "*",
+        "@sveltejs/vite-plugin-svelte": "*",
+        "@types/eslint": "*",
+        "@types/node": "*",
+        "@typescript-eslint/eslint-plugin": "*",
+        "@typescript-eslint/parser": "*",
+        "eslint": "*",
+        "eslint-config-prettier": "*",
+        "eslint-plugin-svelte": "*",
+        "prettier": "*",
+        "prettier-plugin-svelte": "*",
+        "sass": "*",
+        "svelte": "*",
+        "svelte-check": "*",
+        "tslib": "*",
+        "typescript": "*",
+        "vite": "*",
+        "vitest": "*"
+    },
+    "overrides": {
+        "cookie": "^0.7.0"
+    }
+}
