@@ -1,460 +1,214 @@
-# Hedging Strategy — Unified State Machine & Checklist
-**IBKR Live & Paper Trading (Bracket-Based, Event-Driven)**
+# Long/Short Hedging Strategy — Product Specification (IBKR Stocks) v2
 
-It’s a low-frequency volatility capture strategy with insurance symmetry (A volatility-triggered directional capture strategy with temporary neutrality.)
+## 0. Scope and Authority
 
-> **Principle**
-> - IBKR paper trading uses **live execution logic**.
-> - **Broker events are authoritative** (orders, fills, positions).
-> - **No bar-based stop inference**, no tie-breaker logic.
-> - Paper and live share **identical code paths**.
+This specification defines a **broker-executed, event-driven** hedging strategy for **stocks on IBKR** (paper trading and live trading share the same logic).
+
+**Authority order (truth sources):**
+1) **Executions** (fills) — primary truth
+2) **Open orders** — validate protection and working exits
+3) **Positions()** — sanity check only (stocks are netted)
+
+**Hard invariant:**
+If the system cannot prove that exposure is protected and quantities are known, it must **cancel orders and flatten**.
 
 ---
 
-## 1. State Machine
+## 1. IBKR Equity Netting Constraint (Critical)
 
-### State Diagram
+IBKR equities are **netted per symbol** at the account level.
 
-┌──────────┐
-│ IDLE │
-└────┬─────┘
-│ entry conditions met
-▼
-┌──────────┐
-│ ENTERING │
-└────┬─────┘
-│ both brackets live & parents filled
-▼
-┌──────────┐
-│ HEDGED │
-└────┬─────┘
-│ IBKR stop execution (paper/live)
-▼
-┌────────────┐
-│ SINGLE_LEG │
-└────┬───────┘
-│ trailing stop execution
-▼
-┌──────────┐
-│ COOLDOWN │
-└────┬─────┘
-│ delay elapsed
-▼
-┌──────────┐
-│ IDLE │
-└──────────┘
+- The strategy must **not** assume that long and short legs appear as distinct open positions.
+- Strategy state and remaining quantities must be derived from an **execution ledger** plus open orders.
+- `positions()` is used only to detect accidental leftover exposure (e.g., net != 0 when strategy expects flat).
+
+---
+
+## 2. Parameters (Configurable)
+
+- `symbol` — stock symbol (default: NVDA)
+- `notionalPerLegUSD` — notional per leg (default: 100 USD)
+- `slPct` — initial stop-loss percentage (default: 0.03)
+- `trailingPct` — trailing percentage for the surviving exposure (default: 0.15)
+- `barSize` — cooldown cadence (default: 1 minute bars)
+- `cooldownBars` — delay between cycles (default: 1 bar)
+- `sessionMode` — **OVERNIGHT_ALLOWED** (no forced flat)
+- IBKR connectivity: `host`, `port`, `clientId` (clientId required, any unique integer)
+
+---
+
+## 3. Strategy Cycle Overview
+
+A full cycle has three phases:
+
+1. **Entry Phase** — establish both legs as independent bracket orders (each leg has attached SL)
+2. **Hedge Break Phase** — one initial SL gets any fill; the hedge is broken
+3. **Final Exit Phase** — replace remaining initial SL with a trailing stop; cycle ends when trailing stop fills
+
+---
+
+## 4. Order Model
+
+### 4.1 Leg Bracket (Per Leg)
+
+Each leg is a **bracket-like chain**:
+
+- Parent: Market order (transmit = False)
+- Child: Stop order (transmit = True, parentId = parent.orderId)
+
+This guarantees **atomicity within a leg** (parent + SL submitted together).
+
+### 4.2 Cross-Leg Atomicity Limit
+
+IBKR cannot guarantee a single atomic transaction across **two independent parents**.
+Therefore the system must implement **Two-Phase Entry**.
+
+---
+
+## 5. State Machine
+
+States:
+
+- `IDLE` — no active cycle
+- `ENTERING` — submitting legs and confirming stop protection
+- `HEDGED` — both initial stops live; waiting for hedge break via broker execution
+- `SINGLE_LEG` — hedge broken; trailing stop manages remaining exposure
+- `COOLDOWN` — wait N bars before next cycle
+- `DEGRADED` — disconnect/unsafe; freeze, reconcile, and possibly flatten
+
+---
+
+## 6. Entry Phase (Two-Phase Entry)
+
+### 6.1 Two-Phase Entry Procedure
+
+1) Submit **Leg A bracket** (parent + SL)
+2) Wait for **Leg A SL to be LIVE**
+3) If Leg A parent fills before SL is LIVE → **abort + flatten**
+4) Submit **Leg B bracket**
+5) Wait for **Leg B SL to be LIVE**
+6) If any parent fills while its SL is not LIVE → **abort + flatten**
+7) If both SLs are LIVE → transition to `HEDGED`
+
+### 6.2 Definition: “SL Live”
+
+An SL is considered **LIVE** only if order status is:
+
+- `PreSubmitted` or `Submitted`
+
+Not live:
+- `PendingSubmit`, `PendingCancel`, or any error-like status
+
+Terminal-bad:
+- `Rejected` (always triggers abort/flatten)
+
+---
+
+## 7. Partial Fill Policy
+
+### 7.1 During ENTERING
+
+- Partial hedge is forbidden.
+- If one parent has any fill while the other does not fill within a short grace window → **cancel + flatten**.
+
+### 7.2 During HEDGED
+
+- A hedge break occurs when **any initial SL has any fill** (`filled > 0`), even partial.
+- If **both** initial SLs have any fill (extreme move) and ordering cannot be proven safe → **flatten**.
+
+---
+
+## 8. Hedge Break Logic (Execution-Ledger Driven)
+
+### 8.1 Execution Ledger
+
+Maintain cumulative fills:
+
+- `parentFilledQty[LONG|SHORT]`
+- `slFilledQty[LONG|SHORT]`
+
+### 8.2 Determine Loser/Survivor
+
+- Loser = leg whose initial SL has any fill
+- Survivor = opposite leg
+
+If loser cannot be determined unambiguously → flatten.
+
+### 8.3 Remaining Quantity
+
+Remaining survivor exposure:
+
+remainingQty = parentFilledQty[survivor] - slFilledQty[survivor]
 
 yaml
 Copy code
 
----
-
-### State Definitions
-
-#### `IDLE`
-- No positions
-- No open orders
-
-**Transition → `ENTERING`**
-- Trading window open
-- Cooldown elapsed
-- Account reconciled (positions = 0, open orders = 0)
+If remainingQty <= 0 or ambiguous → flatten.
 
 ---
 
-#### `ENTERING`
-- Create hedge using **two independent bracket orders**
+## 9. Replace Protection Safely (Cancel-Then-Replace)
 
-**Actions (atomic)**
-- **Long Bracket**
-  - Parent: BUY market
-  - Child: SELL stop @ `entry * (1 - slPct)`
-- **Short Bracket**
-  - Parent: SELL market
-  - Child: BUY stop @ `entry * (1 + slPct)`
+On hedge break:
 
-**Rules**
-- Entry + SL submitted together
-- No naked exposure possible
-
-**Failure Handling**
-- If any bracket fails or partial:
-  - Cancel everything
-  - Return to `IDLE`
-
-**Transition → `HEDGED`**
-- Both parents filled
-- Both SL children acknowledged live by IBKR
+1) Cancel the remaining initial SL (the survivor leg’s initial SL)
+2) Await terminal cancel status (timeout)
+3) If cancellation does not complete in time → flatten
+4) Submit trailing stop sized to `remainingQty`
+5) Confirm trailing stop is LIVE; if rejected/inactive:
+   - retry once
+   - if still not live → flatten
 
 ---
 
-#### `HEDGED`
-- Long and short both open
-- Initial SLs fully broker-managed
+## 10. Trailing Stop (Final Exit)
 
-**Monitoring**
-- Listen to IBKR:
-  - Order status events
-  - Execution reports
-  - Position updates
+Trailing stop is placed broker-side:
 
-**Hedge Break**
-- One SL executes at IBKR (paper or live)
+- `orderType="TRAIL"`
+- `trailingPercent = trailingPct * 100`
 
-**Paper/Live Guard**
-- Immediately **reconcile**:
-  - Query positions
-  - Query open orders
-
-**Transition → `SINGLE_LEG`**
-- Exactly one position remains open
+Final exit when trailing stop fills → cycle ends → enter `COOLDOWN`.
 
 ---
 
-#### `SINGLE_LEG`
-- One directional leg remains
+## 11. Disconnect and Safety Rules
 
-**Actions**
-- Cancel remaining leg’s **initial SL**
-- Submit **trailing stop** for surviving leg
+### 11.1 On Disconnect
 
-**Trailing**
-- Long: trail below highest favorable price
-- Short: trail above lowest favorable price
-- Update once per bar (non-time-critical)
+- Enter `DEGRADED`
+- Stop placing/modifying orders
 
-**Exit**
-- Trailing stop filled by IBKR
+### 11.2 On Reconnect
 
-**Paper/Live Guard**
-- Re-query positions to confirm flat
+- Reconcile open orders and net position
+- If any ambiguity remains → flatten
 
-**Transition → `COOLDOWN`**
+### 11.3 Global Invariant: Flatten If Ambiguous
 
----
+At any point if the system cannot prove:
+- exposure is protected, and
+- quantities are known, and
+- order state is safe,
 
-#### `COOLDOWN`
-- Cycle finished
-- Re-entry blocked
+then it must:
+- cancel all orders for the symbol
+- market-flatten any residual net position
+- enter `COOLDOWN`
 
-**Transition → `IDLE`**
-- Cooldown time/bars elapsed
-- Account confirmed flat
+Capital preservation overrides continuity.
 
 ---
 
-## 2. Execution Checklist (Paper = Live)
+## 12. Paper Trading
 
-### 2.1 Startup / Mode Declaration
-- [ ] `mode ∈ { PAPER, LIVE }` set and logged
-- [ ] Connected to correct IBKR endpoint
-- [ ] Strategy logic identical for both modes
+Paper trading must use the **same live execution logic**:
 
----
+- no bar-inferred stop logic
+- no tie-breakers
+- broker events and the ledger are authoritative
 
-### 2.2 Pre-Trade Checks
-
-**Connectivity & Account**
-- [ ] IBKR Gateway / TWS connected
-- [ ] US stocks enabled
-- [ ] Short selling enabled
-- [ ] Fractional shares enabled
-- [ ] No manual positions on symbol
-
-**Instrument Validation**
-- [ ] Contract resolved (SMART / USD)
-- [ ] Shortable flag = true
-- [ ] Trading hours loaded (RTH vs ETH)
-
-**Strategy Parameters**
-- [ ] `notionalPerLeg = $100`
-- [ ] `slPct = 3–4%`
-- [ ] `trailingPct` defined
-- [ ] `barSize = 1m`
-- [ ] `cooldown` defined
-- [ ] `sessionMode ∈ { RTH_ONLY, OVERNIGHT_ALLOWED }`
-
----
-
-### 2.3 Entry (`IDLE → ENTERING`)
-
-**Preconditions**
-- [ ] State = `IDLE`
-- [ ] Positions = 0
-- [ ] Open orders = 0
-- [ ] Trading window open
-- [ ] Cooldown elapsed
-
-**Bracket Construction**
-
-_Long Bracket_
-- [ ] BUY market
-- [ ] Qty = `100 / last_price`
-- [ ] Attached SELL stop @ `entry * (1 - slPct)`
-
-_Short Bracket_
-- [ ] SELL market
-- [ ] Qty = `100 / last_price`
-- [ ] Attached BUY stop @ `entry * (1 + slPct)`
-
-**Submission Validation**
-- [ ] Both parents filled
-- [ ] Both SL children live
-
-**Failure**
-- [ ] Cancel all orders
-- [ ] Return to `IDLE`
-
----
-
-### 2.4 Hedge Monitoring (`HEDGED`)
-- [ ] Listen for IBKR execution events
-- [ ] Detect SL execution on one leg
-- [ ] **Immediately reconcile** positions & open orders
-- [ ] Confirm exactly one position remains
-
-> No bar-based SL logic
-> No tie-breaker (paper = live)
-
----
-
-### 2.5 Hedge Break Handling (`HEDGED → SINGLE_LEG`)
-- [ ] Identify surviving leg
-- [ ] Cancel its **initial SL**
-- [ ] Submit **trailing stop**
-
----
-
-### 2.6 Trailing Phase (`SINGLE_LEG`)
-- [ ] Update favorable extreme per bar
-- [ ] Adjust trailing stop (one direction only)
-- [ ] Trailing stop filled
-- [ ] **Re-query positions**
-- [ ] Confirm flat
-- [ ] Cancel residual orders
-
----
-
-### 2.7 Session Handling
-
-**RTH_ONLY**
-- [ ] At session end:
-  - Close any open positions
-  - Cancel all orders
-  - Reconcile
-  - Reset state
-
-**OVERNIGHT_ALLOWED**
-- [ ] Accept gap risk
-- [ ] Resume next session normally
-
----
-
-### 2.8 Safety Rules (Always On)
-- [ ] Never infer stops from bars
-- [ ] Never override broker executions
-- [ ] Always reconcile after:
-  - Stop fills
-  - Trailing fills
-  - Reconnects
-- [ ] Paper trading ≠ backtesting (same execution rules)
-
----
-
-### 2.9 Post-Cycle Accounting
-- [ ] Record entry fills
-- [ ] Record stop / trailing fills
-- [ ] Compute PnL per leg and net
-- [ ] Tag outcome: long-win / short-win / forced-exit
-- [ ] Mark mode: PAPER or LIVE
-
----
-
-## 4. Summary
-- Bracket-based entry with attached SLs
-- IBKR is the single source of truth
-- Paper trading uses live logic
-- Deterministic, safe, and go-live ready
-
-
-# Failure-Mode Matrix
-**IBKR Live & Paper Trading (Event-Driven, Bracket-Based)**
-
-> Principle:
-> **Broker state is authoritative.**
-> On any anomaly → *freeze, reconcile, then decide.*
-
----
-
-## 3. Connectivity Failures
-
-### A. Temporary Disconnect (TWS / Gateway)
-
-| Situation | Detection | Immediate Action | Recovery |
-|---------|----------|------------------|----------|
-| Disconnect while `IDLE` | API disconnect event | Freeze | Reconnect → resume |
-| Disconnect while `ENTERING` | Disconnect before both parents filled | Freeze | Reconnect → cancel all orders → `IDLE` |
-| Disconnect while `HEDGED` | Disconnect with 2 legs open | Freeze | Reconnect → reconcile positions & orders |
-| Disconnect while `SINGLE_LEG` | Disconnect with trailing stop live | Freeze | Reconnect → verify trailing stop exists |
-
-**Rules**
-- Never assume orders failed or filled during disconnect
-- Always re-query:
-  - Positions
-  - Open orders
-  - Executions
-
----
-
-### B. Reconnect with Unexpected State
-
-| Observed State | Expected | Resolution |
-|---------------|----------|-----------|
-| 0 positions, no orders | Any active state | Reset → `IDLE` |
-| 1 position, no stop | `SINGLE_LEG` | Immediately submit trailing stop |
-| 2 positions, no SLs | `HEDGED` | Emergency close both legs |
-| Orders exist, no positions | Any | Cancel orders → reconcile |
-
----
-
-## 2. Partial Fills & Order Anomalies
-
-### A. Parent Order Partial Fill
-
-| Scenario | Action |
-|--------|--------|
-| Long parent partial, short not filled | Cancel both brackets → `IDLE` |
-| Short parent partial, long not filled | Cancel both brackets → `IDLE` |
-| Both parents partially filled | Cancel everything → flatten → `IDLE` |
-
-**Rule**
-- Strategy **never allows partial hedges**
-- Symmetry is mandatory
-
----
-
-### B. Child Stop Rejected or Missing
-
-| Scenario | Action |
-|--------|--------|
-| SL rejected on one leg | Cancel entire hedge → flatten |
-| SL not acknowledged | Cancel parent (if possible) |
-| SL disappears unexpectedly | Immediate market close |
-
----
-
-## 3. Hedge-Break Edge Cases
-
-### A. Both Stops Trigger (Extreme Move)
-
-| Outcome | Action |
-|-------|--------|
-| Both legs closed | Accept full loss → `COOLDOWN` |
-| One leg remains | Treat as normal hedge break |
-| Broker order sequencing unclear | Reconcile → trust final positions |
-
-**Rule**
-- Do **not** attempt reconstruction
-- Final positions = truth
-
----
-
-### B. Stop Executes but Position Still Shows Open (Paper Lag)
-
-| Detection | Action |
-|---------|--------|
-| Stop filled, position still visible | Wait → re-query |
-| Position persists after retry | Market close immediately |
-
----
-
-## 4. Trailing Stop Failures
-
-### A. Trailing Stop Rejected
-
-| Scenario | Action |
-|--------|--------|
-| Rejected on submit | Retry once |
-| Still rejected | Market close |
-| API error | Flatten |
-
----
-
-### B. Trailing Stop Missing After Reconnect
-
-| Scenario | Action |
-|--------|--------|
-| Position open, no trailing stop | Re-submit trailing stop immediately |
-| Cannot confirm | Market close |
-
----
-
-## 5. Session Edge Cases (Stocks)
-
-### A. Session End (RTH_ONLY)
-
-| State | Action |
-|-----|--------|
-| `ENTERING` | Cancel orders |
-| `HEDGED` | Market close both legs |
-| `SINGLE_LEG` | Market close remaining |
-| `COOLDOWN` | No action |
-
----
-
-### B. Market Halt / LULD
-
-| Detection | Action |
-|---------|--------|
-| Halt during `HEDGED` | Freeze |
-| Halt during `SINGLE_LEG` | Freeze |
-| Resume | Reconcile → re-apply stops if needed |
-
----
-
-## 6. Paper-Trading Specific Quirks
-
-| Issue | Mitigation |
-|-----|-----------|
-| Event lag | Always reconcile after executions |
-| Idealized fills | Do not rely on fill quality |
-| Borrow always available | Still validate short leg exists |
-
----
-
-## 7. Global Invariants (Never Violated)
-
-- ❌ Never hold unprotected positions
-- ❌ Never infer execution order from bars
-- ❌ Never continue with partial hedge
-- ✅ Always reconcile after anomalies
-- ✅ Flatten if state is ambiguous
-
----
-
-## 8. Escalation Rule (Simple & Safe)
-
-> **If the bot cannot prove the current state is safe → flatten everything.**
-
-Capital preservation > strategy purity.
-
----
-
-## Final Note
-
-This matrix completes the system.
-
-You now have:
-- ✅ State machine
-- ✅ Execution checklist
-- ✅ Paper = live parity
-- ✅ **Failure-mode matrix**
-
-This is now **production-grade logic**, not just a strategy idea.
-
-If you want next:
-- Convert this matrix into **code-level guards**
-- Add **unit-test scenarios per failure**
-- Produce a **one-page “kill-switch policy”**
-
-Just say the word.
+Minor paper quirks (lag/idealized fills) are handled by:
+- ledger-driven state
+- short non-blocking waits
+- flatten-if-ambiguous invariant

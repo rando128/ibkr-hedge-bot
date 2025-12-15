@@ -1,27 +1,34 @@
-# hedge_stock_ibkr.py
 """
-IBKR Hedging Bot (Paper/Live compatible) — ib_insync + config.yaml
-==================================================================
+hedge_stock_ibrk.py — IBKR Hedging Bot (Stocks, ib_insync) — Final v2
+===============================================================
 
-Implements:
-- Configurable stock symbol (default NVDA)
-- Enter TWO independent bracket legs (long + short), each with attached stop-loss (slPct)
-- Broker (IBKR) is authoritative for stop executions (event-driven)
-- After one stop triggers, bot cancels the remaining initial SL and submits a trailing stop (trailingPct)
-- Overnight allowed (no forced flat)
-- Cooldown = 1 bar (1 minute) after cycle ends
-- Fractional shares allowed
-- Failure guards: disconnect freeze, partial fill abort/flatten, missing stops flatten, reconcile after fills
-- Minimal config.yaml loader + CLI override
+Design goals (spec-conformant):
+- IBKR stocks are NETTED per symbol -> do NOT assume two simultaneous positions.
+- Strategy is ORDER/EXECUTION-ledger driven:
+  1) Executions (fills) are truth
+  2) Open orders validate protection
+  3) positions() is safety sanity check only
+- Two-phase entry (best-possible atomicity on IBKR):
+  - Submit Leg A bracket, wait SL child is LIVE (PreSubmitted/Submitted)
+  - If parent fills before SL live -> ABORT+FLATTEN
+  - Submit Leg B bracket, wait SL live
+- Strict SL "live" definition: {"PreSubmitted","Submitted"} only
+- Hedge break occurs on ANY stop fill (partial included) on either initial SL
+- On hedge break:
+  - Determine loser/survivor via execution ledger (not positions())
+  - Cancel remaining initial SL and await terminal
+  - Submit trailing stop for survivor sized from ledger remaining qty
+  - If ambiguity persists -> flatten (global invariant)
+- Non-blocking waits: use ib.sleep(), no time.sleep() in event loop
+- Trailing stop created via generic Order(orderType="TRAIL", trailingPercent=...)
 
-Usage:
+Dependencies:
   pip install ib_insync pyyaml
-  python hedge_stock_ibkr.py --config config.yaml
-  python hedge_stock_ibkr.py --config config.yaml --symbol AAPL --port 7497
 
-Notes:
-- IBKR requires a clientId. Any integer is fine, but it must be unique per running client.
-- IBKR positions for stocks are netted per symbol. This bot is therefore ORDER/EVENT-driven.
+Run:
+  python hedge_stock_ibrk.py --config config.yaml
+Optional overrides:
+  python hedge_stock_ibrk.py --config config.yaml --symbol NVDA --port 7497 --client-id 7
 """
 
 from __future__ import annotations
@@ -31,26 +38,33 @@ import dataclasses
 import logging
 import sys
 import time
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from datetime import datetime, timedelta
 from enum import Enum
-from typing import Optional, List, Dict, Any
+from typing import Any, Dict, Optional, Tuple
 
-import yaml  # pip install pyyaml
+import yaml
 from ib_insync import (
     IB,
+    Order,
     Stock,
+    Trade,
     MarketOrder,
     StopOrder,
-    Order,
-    Trade,
-    BarDataList,
     util,
 )
 
 # -----------------------------
+# Status semantics (spec)
+# -----------------------------
+LIVE_STATUSES = {"PreSubmitted", "Submitted"}
+TERMINAL_STATUSES = {"Filled", "Cancelled", "ApiCancelled", "Inactive", "Rejected"}
+BAD_STATUSES = {"Rejected"}  # terminal-bad
+
+# -----------------------------
 # Config
 # -----------------------------
+
 
 @dataclass
 class Config:
@@ -61,27 +75,32 @@ class Config:
 
     # Strategy
     notional_per_leg_usd: float = 100.0
-    sl_pct: float = 0.03            # 3%
-    trailing_pct: float = 0.15      # 15% (we convert to IB trailingPercent units)
+    sl_pct: float = 0.03          # 3%
+    trailing_pct: float = 0.15    # 15% (we convert to trailingPercent=15.0)
     bar_size: str = "1 min"
-    cooldown_bars: int = 1          # 1 bar = 1 min
+    cooldown_bars: int = 1        # 1 bar = 1 min
 
     # IBKR connection defaults (configurable)
     host: str = "127.0.0.1"
-    port: int = 7497                # TWS paper default; Gateway paper often 4002
-    client_id: int = 1              # Required. Any int, but unique per bot instance.
+    port: int = 7497              # TWS paper default; gateway paper often 4002
+    client_id: int = 1            # REQUIRED; any int but unique per running client
 
-    # Operational safety
-    entering_timeout_sec: int = 30
+    # Safety / timings
+    entering_timeout_sec: float = 30.0
+    sl_live_timeout_sec: float = 2.0
+    cancel_timeout_sec: float = 2.0
+    trailing_live_timeout_sec: float = 2.0
     reconcile_retries: int = 3
-    reconcile_retry_delay_sec: float = 1.0
+    reconcile_retry_delay_sec: float = 0.25
+
+    # Optional correctness
+    price_rounding: str = "cent"  # "cent" or "minTick" (minTick not always accessible reliably)
 
     # Logging
-    log_level: str = "DEBUG"         # DEBUG / INFO / WARNING / ERROR
+    log_level: str = "INFO"       # DEBUG / INFO / WARNING / ERROR
 
 
 def _deep_merge(base: Dict[str, Any], overlay: Dict[str, Any]) -> Dict[str, Any]:
-    """Recursively merge overlay into base (overlay wins)."""
     out = dict(base)
     for k, v in overlay.items():
         if isinstance(v, dict) and isinstance(out.get(k), dict):
@@ -92,40 +111,43 @@ def _deep_merge(base: Dict[str, Any], overlay: Dict[str, Any]) -> Dict[str, Any]
 
 
 def load_config_from_yaml(path: str) -> Dict[str, Any]:
-    """Load YAML into a plain dict. Minimal and strict-ish."""
     with open(path, "r", encoding="utf-8") as f:
         data = yaml.safe_load(f) or {}
     if not isinstance(data, dict):
-        raise ValueError("config.yaml must contain a mapping/dictionary at the top level.")
+        raise ValueError("config.yaml must be a mapping/dictionary.")
     return data
 
 
+def _validate_config(cfg: Config) -> None:
+    if not cfg.symbol:
+        raise ValueError("symbol is required")
+    if cfg.notional_per_leg_usd <= 0:
+        raise ValueError("notional_per_leg_usd must be > 0")
+    if not (0 < cfg.sl_pct < 1):
+        raise ValueError("sl_pct must be in (0,1) e.g. 0.03")
+    if not (0 < cfg.trailing_pct < 1):
+        raise ValueError("trailing_pct must be in (0,1) e.g. 0.15")
+    if cfg.cooldown_bars < 0:
+        raise ValueError("cooldown_bars must be >= 0")
+    if cfg.client_id is None:
+        raise ValueError("client_id is required (unique per running client)")
+
+
 def config_from_sources(defaults: Config, yaml_dict: Optional[Dict[str, Any]], cli: argparse.Namespace) -> Config:
-    """
-    Build Config from:
-      1) defaults (dataclass)
-      2) YAML (optional)
-      3) CLI overrides (optional)
-    """
     d = dataclasses.asdict(defaults)
 
-    # Allow YAML nesting for ibkr: {host, port, client_id}
     if yaml_dict:
         normalized = dict(yaml_dict)
-
         if "ibkr" in normalized and isinstance(normalized["ibkr"], dict):
             ibkr = normalized.pop("ibkr")
-            # Map YAML keys to flat Config keys
-            if "host" in ibkr:
-                normalized["host"] = ibkr["host"]
-            if "port" in ibkr:
-                normalized["port"] = ibkr["port"]
-            if "client_id" in ibkr:
-                normalized["client_id"] = ibkr["client_id"]
-
+            normalized = _deep_merge(normalized, {
+                "host": ibkr.get("host", d["host"]),
+                "port": ibkr.get("port", d["port"]),
+                "client_id": ibkr.get("client_id", d["client_id"]),
+            })
         d = _deep_merge(d, normalized)
 
-    # CLI overrides (only if provided)
+    # CLI overrides
     if cli.symbol:
         d["symbol"] = cli.symbol
     if cli.host:
@@ -135,7 +157,6 @@ def config_from_sources(defaults: Config, yaml_dict: Optional[Dict[str, Any]], c
     if cli.client_id is not None:
         d["client_id"] = cli.client_id
 
-    # Strategy numeric overrides
     if cli.notional is not None:
         d["notional_per_leg_usd"] = cli.notional
     if cli.sl_pct is not None:
@@ -144,8 +165,6 @@ def config_from_sources(defaults: Config, yaml_dict: Optional[Dict[str, Any]], c
         d["trailing_pct"] = cli.trailing_pct
     if cli.cooldown_bars is not None:
         d["cooldown_bars"] = cli.cooldown_bars
-
-    # Logging override
     if cli.log_level:
         d["log_level"] = cli.log_level
 
@@ -154,24 +173,10 @@ def config_from_sources(defaults: Config, yaml_dict: Optional[Dict[str, Any]], c
     return cfg
 
 
-def _validate_config(cfg: Config) -> None:
-    if not cfg.symbol or not isinstance(cfg.symbol, str):
-        raise ValueError("symbol must be a non-empty string.")
-    if cfg.notional_per_leg_usd <= 0:
-        raise ValueError("notional_per_leg_usd must be > 0.")
-    if not (0 < cfg.sl_pct < 1):
-        raise ValueError("sl_pct must be in (0, 1). Example: 0.03")
-    if not (0 < cfg.trailing_pct < 1):
-        raise ValueError("trailing_pct must be in (0, 1). Example: 0.15")
-    if cfg.cooldown_bars < 0:
-        raise ValueError("cooldown_bars must be >= 0.")
-    if cfg.client_id is None:
-        raise ValueError("client_id is required (any integer, but unique per running client).")
-
-
 # -----------------------------
 # State machine
 # -----------------------------
+
 
 class State(str, Enum):
     IDLE = "IDLE"
@@ -179,21 +184,60 @@ class State(str, Enum):
     HEDGED = "HEDGED"
     SINGLE_LEG = "SINGLE_LEG"
     COOLDOWN = "COOLDOWN"
-    DEGRADED = "DEGRADED"  # disconnect/unsafe
+    DEGRADED = "DEGRADED"  # disconnected / unsafe
 
 
 @dataclass
-class LegOrders:
-    parent_trade: Optional[Trade] = None
-    sl_trade: Optional[Trade] = None
+class Leg:
+    parent: Optional[Trade] = None
+    sl: Optional[Trade] = None
+
+
+@dataclass
+class ExecLedger:
+    # Cumulative fills per leg
+    parent_filled: Dict[str, float] = field(default_factory=lambda: {"LONG": 0.0, "SHORT": 0.0})
+    sl_filled: Dict[str, float] = field(default_factory=lambda: {"LONG": 0.0, "SHORT": 0.0})
+
+    def record_parent_fill(self, leg: str, qty: float) -> None:
+        self.parent_filled[leg] += float(qty)
+
+    def record_sl_fill(self, leg: str, qty: float) -> None:
+        self.sl_filled[leg] += float(qty)
+
+    def any_sl_fill(self) -> bool:
+        return (self.sl_filled["LONG"] > 0) or (self.sl_filled["SHORT"] > 0)
+
+    def loser_leg(self) -> Optional[str]:
+        # Loser is the leg whose SL has any fill
+        if self.sl_filled["LONG"] > 0 and self.sl_filled["SHORT"] > 0:
+            # extremely violent move; ambiguous - handled by flatten
+            return "BOTH"
+        if self.sl_filled["LONG"] > 0:
+            return "LONG"
+        if self.sl_filled["SHORT"] > 0:
+            return "SHORT"
+        return None
+
+    def survivor_leg(self) -> Optional[str]:
+        loser = self.loser_leg()
+        if loser == "LONG":
+            return "SHORT"
+        if loser == "SHORT":
+            return "LONG"
+        return None
+
+    def remaining_qty(self, leg: str) -> float:
+        # Remaining exposure on a leg = parent fills - SL fills on same leg
+        # (SL fills represent exits for that leg)
+        return max(0.0, self.parent_filled[leg] - self.sl_filled[leg])
 
 
 @dataclass
 class CycleContext:
-    long_leg: LegOrders = dataclasses.field(default_factory=LegOrders)
-    short_leg: LegOrders = dataclasses.field(default_factory=LegOrders)
-    survivor: Optional[str] = None            # "LONG" or "SHORT"
-    trailing_trade: Optional[Trade] = None
+    long: Leg = field(default_factory=Leg)
+    short: Leg = field(default_factory=Leg)
+    trailing: Optional[Trade] = None
     entering_started_at: Optional[datetime] = None
     cycle_ended_at_bar_time: Optional[datetime] = None
 
@@ -202,34 +246,51 @@ class CycleContext:
 # Bot
 # -----------------------------
 
-class HedgeBot:
+
+class HedgeBotV2:
     def __init__(self, cfg: Config) -> None:
         self.cfg = cfg
         self.ib = IB()
+
         self.state: State = State.IDLE
         self.ctx = CycleContext()
+        self.ledger = ExecLedger()
 
         self.contract = Stock(cfg.symbol, cfg.exchange, cfg.currency)
-
-        self.bars: Optional[BarDataList] = None
         self.last_bar_time: Optional[datetime] = None
-
         self.degraded_reason: Optional[str] = None
 
-        self.logger = logging.getLogger("hedge-bot")
-        self.logger.setLevel(self._parse_log_level(cfg.log_level))
+        self._orderid_to_role: Dict[int, Tuple[str, str]] = {}  # orderId -> (leg, role) where role ∈ {"PARENT","SL","TRAIL"}
+
+        self.logger = logging.getLogger("hedge-bot-v2")
+        self.logger.setLevel(getattr(logging, cfg.log_level.upper(), logging.INFO))
         handler = logging.StreamHandler(sys.stdout)
         handler.setFormatter(logging.Formatter("%(asctime)s | %(levelname)s | %(message)s"))
         if not self.logger.handlers:
             self.logger.addHandler(handler)
 
-    def _parse_log_level(self, s: str) -> int:
-        return getattr(logging, s.upper(), logging.INFO)
+    # -------- status helpers --------
 
-    # -------- Connection / subscriptions --------
+    def _status(self, tr: Optional[Trade]) -> Optional[str]:
+        if not tr or not tr.orderStatus:
+            return None
+        return tr.orderStatus.status
+
+    def _is_live(self, tr: Optional[Trade]) -> bool:
+        st = self._status(tr)
+        return st in LIVE_STATUSES
+
+    def _is_terminal(self, tr: Optional[Trade]) -> bool:
+        st = self._status(tr)
+        return (tr is None) or (st in TERMINAL_STATUSES)
+
+    def _is_rejected(self, tr: Optional[Trade]) -> bool:
+        return self._status(tr) in BAD_STATUSES
+
+    # -------- broker connect / events --------
 
     def connect(self) -> None:
-        self.logger.info(f"Connecting to IBKR: host={self.cfg.host} port={self.cfg.port} clientId={self.cfg.client_id}")
+        self.logger.info(f"Connecting: host={self.cfg.host} port={self.cfg.port} clientId={self.cfg.client_id}")
         self.ib.connect(self.cfg.host, self.cfg.port, clientId=int(self.cfg.client_id))
 
         self.ib.disconnectedEvent += self._on_disconnected
@@ -237,327 +298,406 @@ class HedgeBot:
         self.ib.execDetailsEvent += self._on_exec_details
         self.ib.orderStatusEvent += self._on_order_status
 
-        self._qualify_contract()
-        self._subscribe_bars()
-
-        self.reconcile_and_adopt_state(reason="startup")
-
-    def _qualify_contract(self) -> None:
         self.ib.qualifyContracts(self.contract)
-        self.logger.info(f"Qualified contract: {self.contract}")
+        self.logger.info(f"Qualified: {self.contract}")
 
-    def _subscribe_bars(self) -> None:
-        self.bars = self.ib.reqHistoricalData(
+        # Bars used only for cooldown cadence, NOT for stop inference
+        bars = self.ib.reqHistoricalData(
             self.contract,
             endDateTime="",
             durationStr="2 D",
             barSizeSetting=self.cfg.bar_size,
             whatToShow="TRADES",
-            useRTH=False,             # overnight allowed
+            useRTH=False,
             formatDate=1,
             keepUpToDate=True,
         )
-        self.bars.updateEvent += self._on_bars_update
-        self.logger.info(f"Subscribed to {self.cfg.bar_size} bars (keepUpToDate=True).")
+        bars.updateEvent += self._on_bars_update
+        self.logger.info(f"Subscribed to bars: {self.cfg.bar_size} (keepUpToDate=True)")
 
-    # -------- Event handlers --------
+        # Initial sanity
+        self._reconcile_sync(reason="startup")
 
     def _on_disconnected(self) -> None:
-        self.logger.warning("Disconnected from IBKR. Freezing trading actions.")
+        self.logger.warning("Disconnected. Entering DEGRADED.")
         self.state = State.DEGRADED
         self.degraded_reason = "disconnect"
 
     def _on_connected(self) -> None:
-        self.logger.info("Reconnected to IBKR. Reconciling state with broker.")
+        self.logger.info("Reconnected. Reconciling.")
         self.degraded_reason = None
-        self.reconcile_and_adopt_state(reason="reconnect")
-
-    def _on_exec_details(self, trade: Trade, fill) -> None:
-        self.logger.info(
-            f"EXEC: {trade.contract.symbol} {trade.order.action} qty={fill.shares} price={fill.price} "
-            f"orderId={trade.order.orderId}"
-        )
-        # Reconcile after fills (paper/live parity guard)
-        if self.state in (State.HEDGED, State.SINGLE_LEG, State.ENTERING):
-            self.reconcile_and_adopt_state(reason="execDetails")
+        self._reconcile_sync(reason="reconnect")
 
     def _on_order_status(self, trade: Trade) -> None:
-        # Keep this debug-level; it can be noisy
-        s = trade.orderStatus.status
+        # lightweight timeout checks can be placed here if desired
         self.logger.debug(
-            f"ORDER_STATUS: orderId={trade.order.orderId} status={s} "
-            f"filled={trade.orderStatus.filled} remaining={trade.orderStatus.remaining}"
+            f"ORDER_STATUS: id={trade.order.orderId} type={trade.order.orderType} "
+            f"status={trade.orderStatus.status} filled={trade.orderStatus.filled} remaining={trade.orderStatus.remaining}"
         )
 
-    def _on_bars_update(self, bars: BarDataList, has_new_bar: bool) -> None:
+    def _on_exec_details(self, trade: Trade, fill) -> None:
+        order_id = trade.order.orderId
+        qty = float(fill.shares)
+        price = float(fill.price)
+
+        leg, role = self._orderid_to_role.get(order_id, ("UNKNOWN", "UNKNOWN"))
+        self.logger.info(f"EXEC: orderId={order_id} role={role} leg={leg} qty={qty} price={price}")
+
+        # Update ledger
+        if leg in ("LONG", "SHORT") and role == "PARENT":
+            self.ledger.record_parent_fill(leg, qty)
+        elif leg in ("LONG", "SHORT") and role == "SL":
+            self.ledger.record_sl_fill(leg, qty)
+        elif role == "TRAIL":
+            # trailing fill ends cycle; handled by reconcile
+            pass
+
+        # Event-driven transitions
+        if self.state == State.ENTERING:
+            # If any parent fills before its SL is live -> this is unsafe; flatten.
+            # We'll check both legs.
+            self.ib.createTask(self._check_entering_safety())
+        elif self.state == State.HEDGED:
+            # Any SL fill (partial) => hedge break
+            if self.ledger.any_sl_fill():
+                self.ib.createTask(self._handle_hedge_break())
+        elif self.state == State.SINGLE_LEG:
+            # trailing may fill -> reconcile will end cycle
+            self.ib.createTask(self._reconcile_async(reason="execDetails_single"))
+
+    def _on_bars_update(self, bars, has_new_bar: bool) -> None:
         if not has_new_bar or not bars:
             return
         bar = bars[-1]
         bar_time = util.parseIBDatetime(bar.date) if isinstance(bar.date, str) else bar.date
-        if bar_time is None:
-            return
         self.last_bar_time = bar_time
-        self._tick_on_bar(bar_time)
+        self.ib.createTask(self._tick_on_bar())
 
-    # -------- Core loop logic --------
+    # -------- periodic/cooldown tick --------
 
-    def _tick_on_bar(self, bar_time: datetime) -> None:
+    async def _tick_on_bar(self) -> None:
         if self.state == State.DEGRADED:
             return
 
         # Cooldown expiry
-        if self.state == State.COOLDOWN and self.ctx.cycle_ended_at_bar_time is not None:
-            if self._bars_elapsed(self.ctx.cycle_ended_at_bar_time, bar_time) >= self.cfg.cooldown_bars:
+        if self.state == State.COOLDOWN and self.ctx.cycle_ended_at_bar_time and self.last_bar_time:
+            if self._bars_elapsed(self.ctx.cycle_ended_at_bar_time, self.last_bar_time) >= self.cfg.cooldown_bars:
                 self.logger.info("Cooldown elapsed -> IDLE")
-                self._reset_cycle_context(keep_state=True)
+                self._reset_cycle()
                 self.state = State.IDLE
 
-        # ENTERING timeout
-        if self.state == State.ENTERING and self.ctx.entering_started_at is not None:
+        # Entering timeout (wall-clock)
+        if self.state == State.ENTERING and self.ctx.entering_started_at:
             if datetime.now() - self.ctx.entering_started_at > timedelta(seconds=self.cfg.entering_timeout_sec):
-                self.logger.warning("ENTERING timeout: aborting and flattening any partial exposure.")
-                self._abort_and_flatten(reason="entering_timeout")
-                return
+                await self._flatten_if_ambiguous("ENTERING timeout")
 
-        # Start a new cycle
+        # Start cycle if idle
         if self.state == State.IDLE:
-            self._start_new_cycle()
+            await self._start_cycle()
 
-    def _start_new_cycle(self) -> None:
-        if not self._is_flat_on_symbol():
-            self.logger.info("Not flat; skipping entry.")
-            return
-        if self._has_open_orders_on_symbol():
-            self.logger.info("Open orders exist; skipping entry.")
-            return
+    # -------- core flow --------
 
-        last = self._get_last_price()
-        if last is None or last <= 0:
-            self.logger.warning("No valid last price; skipping entry.")
+    async def _start_cycle(self) -> None:
+        # Preconditions: no open orders for this symbol and position sanity (net should be ~0)
+        if self._has_open_orders_symbol():
             return
 
-        qty = self.cfg.notional_per_leg_usd / last
-        qty = max(qty, 0.0001)  # allow fractional
+        # Net position sanity check only (not strategy truth)
+        if abs(self._net_position_symbol()) > 1e-9:
+            self.logger.warning("Net position not flat while IDLE; flattening.")
+            await self._flatten_if_ambiguous("Net position non-zero in IDLE")
+            return
 
-        self.logger.info(
-            f"Entering new cycle: symbol={self.cfg.symbol} last={last:.4f} qty≈{qty:.6f} "
-            f"slPct={self.cfg.sl_pct:.4f} trailingPct={self.cfg.trailing_pct:.4f}"
-        )
+        last = await self._get_last_price()
+        if not last:
+            self.logger.warning("No last price; skipping entry.")
+            return
+
+        qty = max(self.cfg.notional_per_leg_usd / last, 0.0001)
+        self.logger.info(f"Starting cycle: symbol={self.cfg.symbol} last={last:.4f} qty≈{qty:.6f}")
 
         self.state = State.ENTERING
         self.ctx.entering_started_at = datetime.now()
 
-        try:
-            self._submit_leg_bracket(
-                leg_name="LONG",
-                parent_action="BUY",
-                qty=qty,
-                stop_action="SELL",
-                stop_price=last * (1 - self.cfg.sl_pct),
-                store_to=self.ctx.long_leg,
-            )
-            self._submit_leg_bracket(
-                leg_name="SHORT",
-                parent_action="SELL",
-                qty=qty,
-                stop_action="BUY",
-                stop_price=last * (1 + self.cfg.sl_pct),
-                store_to=self.ctx.short_leg,
-            )
-        except Exception as e:
-            self.logger.exception(f"Failed to submit brackets: {e}")
-            self._abort_and_flatten(reason="submit_failed")
+        # Two-phase submission (best-possible atomicity)
+        await self._enter_two_phase(last_price=last, qty=qty)
+
+    async def _enter_two_phase(self, last_price: float, qty: float) -> None:
+        # Phase A: LONG bracket
+        self.ctx.long = Leg()
+        long_parent, long_sl = self._submit_bracket(
+            leg="LONG",
+            parent_action="BUY",
+            stop_action="SELL",
+            qty=qty,
+            stop_price=last_price * (1 - self.cfg.sl_pct),
+        )
+        self.ctx.long.parent = long_parent
+        self.ctx.long.sl = long_sl
+
+        await self._await_trade_live(long_sl, timeout=self.cfg.sl_live_timeout_sec, what="LONG SL live")
+
+        # If long parent filled but long SL not live -> abort
+        if self.ledger.parent_filled["LONG"] > 0 and not self._is_live(long_sl):
+            await self._flatten_if_ambiguous("LONG parent filled before LONG SL live")
             return
 
-        self.reconcile_and_adopt_state(reason="post_submit")
+        # If SL rejected/missing -> abort (await already checks rejection, but keep hard guard)
+        if self._is_rejected(long_sl) or not self._is_live(long_sl):
+            await self._flatten_if_ambiguous("LONG SL not live or rejected")
+            return
 
-    def _submit_leg_bracket(
+        # Phase B: SHORT bracket
+        self.ctx.short = Leg()
+        short_parent, short_sl = self._submit_bracket(
+            leg="SHORT",
+            parent_action="SELL",
+            stop_action="BUY",
+            qty=qty,
+            stop_price=last_price * (1 + self.cfg.sl_pct),
+        )
+        self.ctx.short.parent = short_parent
+        self.ctx.short.sl = short_sl
+
+        await self._await_trade_live(short_sl, timeout=self.cfg.sl_live_timeout_sec, what="SHORT SL live")
+
+        # Partial fill symmetry rule during ENTERING:
+        # If either parent has filled but both have not filled within a small window -> flatten.
+        await self._check_entering_safety()
+
+        # If short SL rejected/missing -> abort
+        if self._is_rejected(short_sl) or not self._is_live(short_sl):
+            await self._flatten_if_ambiguous("SHORT SL not live or rejected")
+            return
+
+        # If we reach here: both SLs are live; hedge considered active
+        self.logger.info("ENTERING -> HEDGED (both initial SLs live)")
+        self.state = State.HEDGED
+
+    async def _check_entering_safety(self) -> None:
+        # Enforce "never partial hedge"
+        long_f = self.ledger.parent_filled["LONG"]
+        short_f = self.ledger.parent_filled["SHORT"]
+
+        # If one side has any fill and the other has zero after a short grace -> abort
+        if (long_f > 0 and short_f == 0) or (short_f > 0 and long_f == 0):
+            # allow a tiny grace window for the other parent to fill
+            await self.ib.sleep(0.25)
+            long_f = self.ledger.parent_filled["LONG"]
+            short_f = self.ledger.parent_filled["SHORT"]
+            if (long_f > 0 and short_f == 0) or (short_f > 0 and long_f == 0):
+                await self._flatten_if_ambiguous("Partial hedge during ENTERING (one parent filled, other not)")
+
+        # If any initial SL is rejected while parent has fills -> abort
+        if self.ledger.parent_filled["LONG"] > 0 and (not self._is_live(self.ctx.long.sl) or self._is_rejected(self.ctx.long.sl)):
+            await self._flatten_if_ambiguous("LONG parent filled but LONG SL not live/rejected")
+        if self.ledger.parent_filled["SHORT"] > 0 and (not self._is_live(self.ctx.short.sl) or self._is_rejected(self.ctx.short.sl)):
+            await self._flatten_if_ambiguous("SHORT parent filled but SHORT SL not live/rejected")
+
+    async def _handle_hedge_break(self) -> None:
+        # If both SLs have fills -> ambiguous extreme -> flatten (spec safety)
+        loser = self.ledger.loser_leg()
+        if loser == "BOTH":
+            await self._flatten_if_ambiguous("Both initial SLs filled (extreme move)")
+            return
+
+        survivor = self.ledger.survivor_leg()
+        if survivor not in ("LONG", "SHORT"):
+            await self._flatten_if_ambiguous("Hedge break but survivor not determinable")
+            return
+
+        self.logger.info(f"HEDGE BREAK: loser={loser} survivor={survivor}")
+        self.state = State.SINGLE_LEG
+
+        # Cancel remaining initial SL (the survivor's initial SL is still active, must be replaced)
+        remaining_sl = self.ctx.long.sl if survivor == "LONG" else self.ctx.short.sl
+        if remaining_sl and not self._is_terminal(remaining_sl):
+            self.ib.cancelOrder(remaining_sl.order)
+            await self._await_trade_terminal(remaining_sl, timeout=self.cfg.cancel_timeout_sec, what="cancel remaining initial SL")
+
+        # After cancel, compute remaining qty from ledger
+        qty = self.ledger.remaining_qty(survivor)
+        if qty <= 0:
+            await self._flatten_if_ambiguous("No remaining qty for survivor after hedge break")
+            return
+
+        # Submit trailing (retry once if needed)
+        await self._submit_trailing_with_retry(survivor_leg=survivor, qty=qty)
+
+        # Reconcile after protection install
+        await self._reconcile_async(reason="post_hedge_break")
+
+    # -------- orders --------
+
+    def _submit_bracket(
         self,
-        leg_name: str,
+        leg: str,
         parent_action: str,
-        qty: float,
         stop_action: str,
+        qty: float,
         stop_price: float,
-        store_to: LegOrders,
-    ) -> None:
+    ) -> Tuple[Trade, Trade]:
+        """
+        One-leg bracket: parent MarketOrder (transmit=False) + child StopOrder (transmit=True).
+        This provides atomicity WITHIN the leg, and we do two-phase to minimize cross-leg risk.
+        """
         parent = MarketOrder(parent_action, qty, transmit=False)
         parent.orderId = self.ib.client.getReqId()
 
-        child = StopOrder(stop_action, qty, stopPrice=self._round_price(stop_price), transmit=True)
+        spx = self._round_price(stop_price)
+        child = StopOrder(stop_action, qty, stopPrice=spx, transmit=True)
         child.parentId = parent.orderId
         child.orderId = self.ib.client.getReqId()
 
-        self.logger.info(
-            f"Submitting {leg_name} bracket: parent {parent_action} MKT qty={qty:.6f} "
-            f"child {stop_action} STP @ {child.auxPrice:.4f} (parentId={parent.orderId})"
-        )
+        self.logger.info(f"Submit {leg} bracket: parent {parent_action} MKT qty={qty:.6f} "
+                         f"child {stop_action} STP @ {spx:.4f} parentId={parent.orderId}")
 
-        store_to.parent_trade = self.ib.placeOrder(self.contract, parent)
-        store_to.sl_trade = self.ib.placeOrder(self.contract, child)
+        parent_trade = self.ib.placeOrder(self.contract, parent)
+        child_trade = self.ib.placeOrder(self.contract, child)
 
-    # -------- Reconciliation & state adoption --------
+        self._orderid_to_role[parent.orderId] = (leg, "PARENT")
+        self._orderid_to_role[child.orderId] = (leg, "SL")
 
-    def reconcile_and_adopt_state(self, reason: str) -> None:
-        for attempt in range(1, self.cfg.reconcile_retries + 1):
-            try:
-                positions = self.ib.positions()
-                sym_positions = [p for p in positions if getattr(p.contract, "symbol", None) == self.cfg.symbol]
-                net_qty = sum(p.position for p in sym_positions)
+        return parent_trade, child_trade
 
-                open_trades = self.ib.openTrades()
-                sym_trades = [t for t in open_trades if t.contract.symbol == self.cfg.symbol]
+    async def _submit_trailing_with_retry(self, survivor_leg: str, qty: float) -> None:
+        action = "SELL" if survivor_leg == "LONG" else "BUY"
+        trailing_percent = max(0.01, self.cfg.trailing_pct * 100.0)
 
-                self.logger.debug(f"Reconcile({reason}) attempt={attempt}: net_qty={net_qty} openTrades={len(sym_trades)}")
-
-                # Recover from degraded: safest is flatten if any exposure/orders
-                if self.state == State.DEGRADED:
-                    if self._has_any_position(sym_positions) or self._has_open_orders_on_symbol():
-                        self.logger.warning("Was DEGRADED with exposure/orders. Flattening for safety.")
-                        self._abort_and_flatten(reason="degraded_recover_flatten")
-                    else:
-                        self.state = State.IDLE
-                    return
-
-                # ENTERING -> HEDGED
-                if self.state == State.ENTERING:
-                    if self._both_parents_filled() and self._both_initial_stops_live():
-                        self.logger.info("ENTERING -> HEDGED (parents filled, both initial stops live)")
-                        self.state = State.HEDGED
-                        return
-
-                    # Partial fill abort rule
-                    if self._any_parent_filled() and not self._both_parents_filled():
-                        self.logger.warning("Partial fill detected during ENTERING. Aborting and flattening.")
-                        self._abort_and_flatten(reason="partial_fill_entering")
-                        return
-
-                # HEDGED -> SINGLE_LEG when any initial stop fills
-                if self.state == State.HEDGED:
-                    if self._any_initial_stop_filled():
-                        self.ctx.survivor = self._infer_survivor_from_fills()
-                        self.logger.info(f"Hedge break detected by IBKR stop fill. Survivor={self.ctx.survivor}")
-                        self._install_trailing_and_cancel_initial(reason="hedge_break")
-                        self.state = State.SINGLE_LEG
-                        return
-
-                # SINGLE_LEG -> COOLDOWN when trailing fills or flat/no orders
-                if self.state == State.SINGLE_LEG:
-                    if self._trade_filled(self.ctx.trailing_trade):
-                        self.logger.info("Trailing filled -> COOLDOWN")
-                        self._end_cycle()
-                        self.state = State.COOLDOWN
-                        return
-
-                    if (not self._has_open_orders_on_symbol()) and (not self._has_any_position(sym_positions)):
-                        self.logger.info("No orders and flat -> COOLDOWN")
-                        self._end_cycle()
-                        self.state = State.COOLDOWN
-                        return
-
-                # Safety reset: active state but broker shows nothing
-                if self.state in (State.ENTERING, State.HEDGED, State.SINGLE_LEG) and \
-                   (not self._has_open_orders_on_symbol()) and (not self._has_any_position(sym_positions)):
-                    self.logger.warning(f"State={self.state} but broker shows flat/no orders. Reset -> IDLE")
-                    self._reset_cycle_context(keep_state=True)
-                    self.state = State.IDLE
-                    return
-
-                return
-
-            except Exception as e:
-                self.logger.warning(f"Reconcile failed attempt {attempt}/{self.cfg.reconcile_retries}: {e}")
-                time.sleep(self.cfg.reconcile_retry_delay_sec)
-
-        self.logger.error("Reconcile failed repeatedly. Flattening for safety.")
-        self._abort_and_flatten(reason="reconcile_failed")
-
-    # -------- Hedge break handling --------
-
-    def _install_trailing_and_cancel_initial(self, reason: str) -> None:
-        # Cancel remaining initial SL (the one that did NOT fill)
-        for leg_name, leg in (("LONG", self.ctx.long_leg), ("SHORT", self.ctx.short_leg)):
-            if leg.sl_trade and leg.sl_trade.orderStatus.status not in ("Filled", "Cancelled", "ApiCancelled", "Inactive"):
-                self.logger.info(f"Cancelling remaining initial SL for {leg_name} (orderId={leg.sl_trade.order.orderId})")
-                self.ib.cancelOrder(leg.sl_trade.order)
-
-        qty = self._qty_estimate()
-        if qty <= 0:
-            self.logger.warning("Could not estimate qty for trailing; flattening for safety.")
-            self._abort_and_flatten(reason="no_qty_for_trailing")
-            return
-
-        if self.ctx.survivor == "LONG":
-            action = "SELL"
-        elif self.ctx.survivor == "SHORT":
-            action = "BUY"
-        else:
-            self.logger.warning("No survivor set; flattening for safety.")
-            self._abort_and_flatten(reason="no_survivor")
-            return
-
-        trailing_percent = max(0.01, self.cfg.trailing_pct * 100.0)  # IB expects percent units
-        trail_order = Order(
+        order = Order(
             action=action,
             orderType="TRAIL",
             totalQuantity=qty,
             trailingPercent=trailing_percent,
         )
 
-        self.logger.info(f"Submitting trailing stop: action={action} qty={qty:.6f} trailingPercent={trailing_percent:.2f}%")
-        self.ctx.trailing_trade = self.ib.placeOrder(self.contract, trail_order)
+        self.logger.info(f"Submit trailing: action={action} qty={qty:.6f} trailingPercent={trailing_percent:.2f}%")
+        tr = self.ib.placeOrder(self.contract, order)
+        self.ctx.trailing = tr
+        self._orderid_to_role[tr.order.orderId] = ("NA", "TRAIL")
 
-        self.reconcile_and_adopt_state(reason=f"install_trailing:{reason}")
+        # Wait for live or terminal quickly; if rejected/inactive, retry once
+        ok = await self._await_trade_live_or_terminal(tr, timeout=self.cfg.trailing_live_timeout_sec, what="trailing live")
+        if ok and self._is_live(tr):
+            return
 
-    # -------- Helpers --------
+        # Retry once if not live
+        self.logger.warning("Trailing not live; retrying once.")
+        tr2 = self.ib.placeOrder(self.contract, order)
+        self.ctx.trailing = tr2
+        self._orderid_to_role[tr2.order.orderId] = ("NA", "TRAIL")
 
-    def _trade_filled(self, trade: Optional[Trade]) -> bool:
-        return bool(trade and trade.orderStatus.status == "Filled")
+        ok2 = await self._await_trade_live_or_terminal(tr2, timeout=self.cfg.trailing_live_timeout_sec, what="trailing live retry")
+        if ok2 and self._is_live(tr2):
+            return
 
-    def _both_parents_filled(self) -> bool:
-        return self._trade_filled(self.ctx.long_leg.parent_trade) and self._trade_filled(self.ctx.short_leg.parent_trade)
+        await self._flatten_if_ambiguous("Trailing could not be confirmed live")
 
-    def _any_parent_filled(self) -> bool:
-        return self._trade_filled(self.ctx.long_leg.parent_trade) or self._trade_filled(self.ctx.short_leg.parent_trade)
+    # -------- awaits (non-blocking) --------
 
-    def _both_initial_stops_live(self) -> bool:
-        long_ok = self.ctx.long_leg.sl_trade is not None and self.ctx.long_leg.sl_trade.orderStatus.status not in ("Cancelled", "ApiCancelled", "Inactive")
-        short_ok = self.ctx.short_leg.sl_trade is not None and self.ctx.short_leg.sl_trade.orderStatus.status not in ("Cancelled", "ApiCancelled", "Inactive")
-        return long_ok and short_ok
+    async def _await_trade_live(self, tr: Trade, timeout: float, what: str) -> None:
+        t0 = time.time()
+        while time.time() - t0 < timeout:
+            if self._is_rejected(tr):
+                await self._flatten_if_ambiguous(f"{what}: rejected")
+                return
+            if self._is_live(tr):
+                return
+            await self.ib.sleep(0.05)
+        await self._flatten_if_ambiguous(f"{what}: timeout (not live)")
 
-    def _any_initial_stop_filled(self) -> bool:
-        return self._trade_filled(self.ctx.long_leg.sl_trade) or self._trade_filled(self.ctx.short_leg.sl_trade)
+    async def _await_trade_terminal(self, tr: Trade, timeout: float, what: str) -> None:
+        t0 = time.time()
+        while time.time() - t0 < timeout:
+            if self._is_terminal(tr):
+                return
+            await self.ib.sleep(0.05)
+        await self._flatten_if_ambiguous(f"{what}: cancel timeout (not terminal)")
 
-    def _infer_survivor_from_fills(self) -> Optional[str]:
-        # If long SL filled => long lost => survivor SHORT
-        if self._trade_filled(self.ctx.long_leg.sl_trade):
-            return "SHORT"
-        if self._trade_filled(self.ctx.short_leg.sl_trade):
-            return "LONG"
-        return None
-
-    def _has_open_orders_on_symbol(self) -> bool:
-        for t in self.ib.openTrades():
-            if t.contract.symbol == self.cfg.symbol and t.orderStatus.status not in ("Filled", "Cancelled", "ApiCancelled", "Inactive"):
+    async def _await_trade_live_or_terminal(self, tr: Trade, timeout: float, what: str) -> bool:
+        t0 = time.time()
+        while time.time() - t0 < timeout:
+            if self._is_live(tr):
                 return True
+            if self._is_terminal(tr):
+                return True
+            await self.ib.sleep(0.05)
+        self.logger.warning(f"{what}: timeout waiting for live/terminal")
         return False
 
-    def _has_any_position(self, sym_positions) -> bool:
-        return any(abs(p.position) > 1e-9 for p in sym_positions)
+    # -------- reconcile & flatten invariant --------
 
-    def _is_flat_on_symbol(self) -> bool:
-        positions = self.ib.positions()
-        sym_positions = [p for p in positions if getattr(p.contract, "symbol", None) == self.cfg.symbol]
-        return abs(sum(p.position for p in sym_positions)) < 1e-9
+    def _reconcile_sync(self, reason: str) -> None:
+        # Minimal sync reconcile: used at startup/reconnect
+        self.logger.info(f"Reconcile(sync): {reason}")
+        # If we reconnect mid-exposure and can't safely adopt, flatten.
+        if self.state == State.DEGRADED:
+            if self._has_open_orders_symbol() or abs(self._net_position_symbol()) > 1e-9:
+                self.logger.warning("DEGRADED with exposure/orders: flattening.")
+                self.ib.createTask(self._flatten_if_ambiguous("DEGRADED sync reconcile"))
+            else:
+                self.state = State.IDLE
 
-    def _qty_estimate(self) -> float:
-        for t in (self.ctx.long_leg.parent_trade, self.ctx.short_leg.parent_trade):
-            if t and t.order and t.order.totalQuantity:
-                return float(t.order.totalQuantity)
-        return 0.0
+    async def _reconcile_async(self, reason: str) -> None:
+        # Non-blocking reconcile loop; if ambiguous beyond retries -> flatten
+        for _ in range(self.cfg.reconcile_retries):
+            if self.state == State.DEGRADED:
+                return
+            # If trailing exists and is filled -> end cycle
+            if self.ctx.trailing and self._status(self.ctx.trailing) == "Filled":
+                await self._end_cycle("Trailing filled")
+                return
+            await self.ib.sleep(self.cfg.reconcile_retry_delay_sec)
 
-    def _get_last_price(self) -> Optional[float]:
+    async def _flatten_if_ambiguous(self, reason: str) -> None:
+        """
+        Global invariant: if safety cannot be proven, cancel everything and market-flatten.
+        """
+        self.logger.error(f"FLATTEN_IF_AMBIGUOUS: {reason}")
+
+        # Cancel all open orders for this symbol
+        for tr in self.ib.openTrades():
+            if tr.contract.symbol == self.cfg.symbol:
+                try:
+                    self.ib.cancelOrder(tr.order)
+                except Exception as e:
+                    self.logger.warning(f"Cancel error: {e}")
+
+        await self.ib.sleep(0.2)
+
+        # Flatten net position if any (sanity layer)
+        net = self._net_position_symbol()
+        if abs(net) > 1e-9:
+            action = "SELL" if net > 0 else "BUY"
+            qty = abs(net)
+            self.logger.warning(f"Flattening net position: {action} {qty}")
+            self.ib.placeOrder(self.contract, MarketOrder(action, qty))
+
+        await self._end_cycle(f"Flattened: {reason}")
+        self.state = State.COOLDOWN
+
+    async def _end_cycle(self, reason: str) -> None:
+        self.logger.info(f"Cycle ended: {reason}")
+        self.ctx.cycle_ended_at_bar_time = self.last_bar_time or datetime.now()
+        # Keep ledger for debugging; reset on cooldown expiry
+        # Also cancel any remaining tracked orders (best-effort)
+        for tr in self.ib.openTrades():
+            if tr.contract.symbol == self.cfg.symbol:
+                try:
+                    self.ib.cancelOrder(tr.order)
+                except Exception:
+                    pass
+
+    def _reset_cycle(self) -> None:
+        self.ctx = CycleContext()
+        self.ledger = ExecLedger()
+        self._orderid_to_role = {}
+
+    # -------- market data / account queries --------
+
+    async def _get_last_price(self) -> Optional[float]:
         ticker = self.ib.reqMktData(self.contract, "", False, False)
-        self.ib.sleep(0.5)
+        await self.ib.sleep(0.4)
         last = None
         if ticker.last:
             last = float(ticker.last)
@@ -568,78 +708,58 @@ class HedgeBot:
         self.ib.cancelMktData(ticker.contract)
         return last
 
+    def _has_open_orders_symbol(self) -> bool:
+        for tr in self.ib.openTrades():
+            if tr.contract.symbol != self.cfg.symbol:
+                continue
+            st = tr.orderStatus.status
+            if st not in TERMINAL_STATUSES:
+                return True
+        return False
+
+    def _net_position_symbol(self) -> float:
+        # Sanity check only (stocks net)
+        net = 0.0
+        for p in self.ib.positions():
+            if getattr(p.contract, "symbol", None) == self.cfg.symbol:
+                net += float(p.position)
+        return net
+
     def _round_price(self, px: float) -> float:
+        # Practical safe default: cents
+        if self.cfg.price_rounding == "cent":
+            return round(px, 2)
         return round(px, 2)
 
-    def _bars_elapsed(self, start: datetime, now: datetime) -> int:
+    @staticmethod
+    def _bars_elapsed(start: datetime, now: datetime) -> int:
         return int((now - start).total_seconds() // 60)
 
-    # -------- Abort / flatten / cycle end --------
-
-    def _abort_and_flatten(self, reason: str) -> None:
-        self.logger.error(f"ABORT+FLATTEN: {reason}")
-        self._cancel_all_tracked_orders()
-        self._flatten_symbol_position()
-        self._reset_cycle_context(keep_state=True)
-        self.state = State.COOLDOWN
-        self.ctx.cycle_ended_at_bar_time = self.last_bar_time or datetime.now()
-
-    def _cancel_all_tracked_orders(self) -> None:
-        trades = [
-            self.ctx.long_leg.parent_trade, self.ctx.long_leg.sl_trade,
-            self.ctx.short_leg.parent_trade, self.ctx.short_leg.sl_trade,
-            self.ctx.trailing_trade,
-        ]
-        for tr in trades:
-            if tr and tr.orderStatus.status not in ("Filled", "Cancelled", "ApiCancelled", "Inactive"):
-                try:
-                    self.logger.info(f"Cancelling orderId={tr.order.orderId} type={tr.order.orderType}")
-                    self.ib.cancelOrder(tr.order)
-                except Exception as e:
-                    self.logger.warning(f"Cancel failed for orderId={tr.order.orderId}: {e}")
-
-    def _flatten_symbol_position(self) -> None:
-        positions = self.ib.positions()
-        sym_positions = [p for p in positions if getattr(p.contract, "symbol", None) == self.cfg.symbol]
-        net_qty = sum(p.position for p in sym_positions)
-        if abs(net_qty) < 1e-9:
-            return
-        action = "SELL" if net_qty > 0 else "BUY"
-        qty = abs(net_qty)
-        self.logger.warning(f"Flattening net position: action={action} qty={qty}")
-        self.ib.placeOrder(self.contract, MarketOrder(action, qty))
-
-    def _end_cycle(self) -> None:
-        self.ctx.cycle_ended_at_bar_time = self.last_bar_time or datetime.now()
-
-    def _reset_cycle_context(self, keep_state: bool = False) -> None:
-        old = self.state
-        self.ctx = CycleContext()
-        if keep_state:
-            self.state = old
-
-    # -------- Run --------
+    # -------- run --------
 
     def run(self) -> None:
-        self.logger.info("Bot running. Ctrl+C to stop.")
+        self.logger.info("Running. Ctrl+C to stop.")
         try:
             self.ib.run()
         except KeyboardInterrupt:
-            self.logger.info("Stopping. Cancelling orders and disconnecting.")
+            self.logger.info("Stopping. Cancelling and disconnecting.")
             try:
-                self._cancel_all_tracked_orders()
+                # best-effort cancel symbol orders
+                for tr in self.ib.openTrades():
+                    if tr.contract.symbol == self.cfg.symbol:
+                        self.ib.cancelOrder(tr.order)
             finally:
                 self.ib.disconnect()
 
 
 # -----------------------------
-# Entrypoint
+# CLI
 # -----------------------------
+
 
 def parse_args() -> argparse.Namespace:
     p = argparse.ArgumentParser()
-    p.add_argument("--config", type=str, default="config.yaml", help="Path to config.yaml")
-    # Common overrides
+    p.add_argument("--config", type=str, default="config.yaml")
     p.add_argument("--symbol", type=str, default=None)
     p.add_argument("--host", type=str, default=None)
     p.add_argument("--port", type=int, default=None)
@@ -649,7 +769,6 @@ def parse_args() -> argparse.Namespace:
     p.add_argument("--sl-pct", type=float, default=None)
     p.add_argument("--trailing-pct", type=float, default=None)
     p.add_argument("--cooldown-bars", type=int, default=None)
-
     p.add_argument("--log-level", type=str, default=None)
     return p.parse_args()
 
@@ -659,16 +778,14 @@ def main() -> None:
     defaults = Config()
 
     yaml_dict = None
-    if args.config:
-        try:
-            yaml_dict = load_config_from_yaml(args.config)
-        except FileNotFoundError:
-            # Allow running without YAML if desired
-            yaml_dict = None
+    try:
+        yaml_dict = load_config_from_yaml(args.config)
+    except FileNotFoundError:
+        yaml_dict = None
 
     cfg = config_from_sources(defaults, yaml_dict, args)
 
-    bot = HedgeBot(cfg)
+    bot = HedgeBotV2(cfg)
     bot.connect()
     bot.run()
 

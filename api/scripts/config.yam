@@ -1,27 +1,29 @@
-# config.yaml
-# Minimal config for the hedging bot (paper trading defaults)
-
 symbol: NVDA
 exchange: SMART
 currency: USD
 
-# Strategy
 notional_per_leg_usd: 100
 sl_pct: 0.03
-trailing_pct: 15 # 15%
+trailing_pct: 0.15
+
 bar_size: "1 min"
 cooldown_bars: 1
 
-# IBKR connection (paper defaults shown)
 ibkr:
   host: 127.0.0.1
   port: 7497
   client_id: 1
 
-# Operations
-entering_timeout_sec: 30
-reconcile_retries: 3
-reconcile_retry_delay_sec: 1.0
+# Timeouts / safety (new in v2)
+entering_timeout_sec: 30.0
+sl_live_timeout_sec: 2.0
+cancel_timeout_sec: 2.0
+trailing_live_timeout_sec: 2.0
 
-# Logging: DEBUG / INFO / WARNING / ERROR
-log_level: DEBUG
+reconcile_retries: 3
+reconcile_retry_delay_sec: 0.25
+
+# Optional
+price_rounding: "cent"   # "cent" (default) or "minTick" (reserved)
+
+log_level: INFO
