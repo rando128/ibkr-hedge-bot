@@ -8,7 +8,7 @@ currency: USD
 # Strategy
 notional_per_leg_usd: 100
 sl_pct: 0.03
-trailing_pct: 0.15
+trailing_pct: 15 # 15%
 bar_size: "1 min"
 cooldown_bars: 1
 

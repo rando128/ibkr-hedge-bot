@@ -42,7 +42,7 @@ from ib_insync import (
     Stock,
     MarketOrder,
     StopOrder,
-    TrailingStopOrder,
+    Order,
     Trade,
     BarDataList,
     util,
@@ -496,10 +496,15 @@ class HedgeBot:
             return
 
         trailing_percent = max(0.01, self.cfg.trailing_pct * 100.0)  # IB expects percent units
-        order = TrailingStopOrder(action, qty, trailingPercent=trailing_percent)
+        trail_order = Order(
+            action=action,
+            orderType="TRAIL",
+            totalQuantity=qty,
+            trailingPercent=trailing_percent,
+        )
 
         self.logger.info(f"Submitting trailing stop: action={action} qty={qty:.6f} trailingPercent={trailing_percent:.2f}%")
-        self.ctx.trailing_trade = self.ib.placeOrder(self.contract, order)
+        self.ctx.trailing_trade = self.ib.placeOrder(self.contract, trail_order)
 
         self.reconcile_and_adopt_state(reason=f"install_trailing:{reason}")
 
