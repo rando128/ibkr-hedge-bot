@@ -1,10 +1,14 @@
 import asyncio
 import argparse
 import math
+from datetime import datetime, timezone
 from ib_insync import IB, Stock, Crypto, MarketOrder, StopOrder, Order, TagValue, util
 
 # MANDATORY: Patch asyncio for ib_insync
 util.patchAsyncio()
+
+# Tracks when the script started to ignore historical fills
+script_start_time = datetime.now(timezone.utc)
 
 def onError(trade, reqId, errorCode, errorString, advancedOrderRejectJson=""):
     """
@@ -17,42 +21,58 @@ def onError(trade, reqId, errorCode, errorString, advancedOrderRejectJson=""):
     code = errorCode if errorString else "INFO"
     print(f"\n[IBKR {code}]: {msg} (reqId={reqId})")
 
-# Global state to manage the two legs and P&L
+# Global state to manage the two legs, P&L, and parameters
 active_trades = {
     'long': None,
     'short': None
 }
 
 pnl_stats = {
-    'entry_cost': 0.0,      # Money spent on entries (Long Buy + Short Sell proceeds)
-    'exit_proceeds': 0.0,   # Money received from exits
-    'total_commission': 0.0,# Sum of all commissions
+    'total_buys': 0.0,      # Sum of all BUY amounts (cash out)
+    'total_sells': 0.0,     # Sum of all SELL amounts (cash in)
+    'total_commission': 0.0,
     'fills': [],
     'symbol': ''
+}
+
+config = {
+    'trailing_pct': 2.0,    # Default trailing percentage
+    'ib': None,             # Will store the IB instance
+    'long_account': '',
+    'short_account': ''
 }
 
 def report_pnl():
     """
     Calculates and prints the combined P&L across all accounts.
     """
-    gross_pnl = pnl_stats['exit_proceeds'] - pnl_stats['entry_cost']
-    net_pnl = gross_pnl - pnl_stats['total_commission']
+    net_pnl = pnl_stats['total_sells'] - pnl_stats['total_buys'] - pnl_stats['total_commission']
+
+    num_fills = len(pnl_stats['fills'])
+    status = "INTERIM" if num_fills < 4 else "FINAL"
 
     print(f"\n========================================")
-    print(f"FULL CYCLE P&L REPORT ({pnl_stats['symbol']})")
+    print(f"{status} HEDGE P&L REPORT ({pnl_stats['symbol']})")
     print(f"----------------------------------------")
-    print(f"Total Entry Basis: {pnl_stats['entry_cost']:.2f}")
-    print(f"Total Exit Value:  {pnl_stats['exit_proceeds']:.2f}")
-    print(f"Total Commissions: {pnl_stats['total_commission']:.2f}")
+    print(f"Total Cash Out (Buys):  {pnl_stats['total_buys']:.2f}")
+    print(f"Total Cash In (Sells):  {pnl_stats['total_sells']:.2f}")
+    print(f"Total Commissions:      {pnl_stats['total_commission']:.2f}")
     print(f"----------------------------------------")
-    print(f"GROSS REALIZED:    {gross_pnl:.2f}")
-    print(f"NET REALIZED P&L:  {net_pnl:.2f}")
+    print(f"NET REALIZED P&L:       {net_pnl:.2f}")
+    if num_fills < 4:
+        print(f"STATUS: CYCLE INCOMPLETE ({num_fills}/4 fills)")
+    else:
+        print(f"STATUS: FULL HEDGE CYCLE COMPLETED")
     print(f"========================================\n")
 
 def onCommissionReport(trade, fill, report):
     """
     Callback when IBKR reports the actual commission for a fill.
     """
+    # Ignore historical commissions from previous sessions
+    if fill.execution.time < script_start_time:
+        return
+
     pnl_stats['total_commission'] += report.commission
     print(f"[COMMISSION]: {report.commission:.2f} {report.currency} for {trade.contract.symbol}")
     # Update report after commission arrives
@@ -65,15 +85,16 @@ def onStopLossFill(trade, fill):
     """
     print(f"\n>>>> STOP LOSS TRIGGERED on {trade.order.account} <<<<")
 
-    # Identify which leg was hit and which one survived
+    # identify the surviving leg
     hit_leg = 'long' if trade == active_trades['long'] else 'short'
     surviving_leg = 'short' if hit_leg == 'long' else 'long'
-
     surviving_trade = active_trades[surviving_leg]
 
     if surviving_trade and not surviving_trade.isDone():
-        print(f"Cancelling surviving Stop Loss on {surviving_trade.order.account}...")
-        trade.ib.cancelOrder(surviving_trade.order)
+        status = surviving_trade.orderStatus.status
+        if status not in ('PendingCancel', 'Cancelled', 'ApiCancelled'):
+            print(f"Cancelling surviving Stop Loss ({status}) on {surviving_trade.order.account}...")
+            config['ib'].cancelOrder(surviving_trade.order)
 
         # Place Trailing Stop on the surviving leg
         # Action must be the same as the original SL (SELL for long, BUY for short)
@@ -81,49 +102,56 @@ def onStopLossFill(trade, fill):
         qty = surviving_trade.order.totalQuantity
         acc = surviving_trade.order.account
 
-        print(f"Switching {surviving_leg.upper()} leg to 2% Trailing Stop on account {acc}...")
+        print(f"Switching {surviving_leg.upper()} leg to {config['trailing_pct']}% Trailing Stop on account {acc}...")
         trail_order = Order(
             action=action,
             totalQuantity=qty,
             orderType='TRAIL',
-            trailingPercent=2.0,
+            trailingPercent=config['trailing_pct'],
             account=acc,
             tif='GTC',
             outsideRth=True
         )
-        trade.ib.placeOrder(trade.contract, trail_order)
+        config['ib'].placeOrder(trade.contract, trail_order)
         print("Trailing Stop submitted. Protection transitioned.")
 
 def onFill(trade, fill):
     """
-    Callback for all order fills. Tracks P&L.
+    Callback for all order fills. Tracks P&L across both legs.
     """
     exec = fill.execution
+
+    # Ignore historical fills from previous sessions
+    if exec.time < script_start_time:
+        return
+
     amount = exec.shares * exec.price
     action = trade.order.action
+    account = trade.order.account
 
     print(f"\n--- EVENT: ORDER FILLED ---")
-    print(f"Account: {trade.order.account} | Action: {action} | Qty: {exec.shares} @ {exec.price}")
+    print(f"Account: {account} | Action: {action} | Qty: {exec.shares} @ {exec.price}")
 
-    # P&L LOGIC
-    # Entry: Buying for Long, Selling for Short
-    # Exit: Selling for Long, Buying for Short
-
-    # We use a simple accounting approach:
-    # BUY is always a negative cash flow (paying money)
-    # SELL is always a positive cash flow (receiving money)
+    # Cash-flow logic:
+    # BUY is always money leaving the account (cost)
+    # SELL is always money entering the account (revenue)
     if action == 'BUY':
-        pnl_stats['entry_cost'] += amount
+        pnl_stats['total_buys'] += amount
     else: # SELL
-        pnl_stats['exit_proceeds'] += amount
+        pnl_stats['total_sells'] += amount
 
     pnl_stats['fills'].append(fill)
 
     if trade.isDone():
-        print(f"Status: {trade.orderStatus.status}")
-        # Only report P&L if we have an exit
-        if len(pnl_stats['fills']) >= 3:
-            report_pnl()
+        print(f"Trade {trade.order.orderId} finished. Status: {trade.orderStatus.status}")
+
+        # A full cycle requires exactly 4 fills
+        num_fills = len(pnl_stats['fills'])
+        report_pnl()
+
+        if num_fills == 4:
+            print(">>> ALL LEGS CLOSED. HEDGE COMPLETE.")
+
     print(f"---------------------------\n")
 
 async def main():
@@ -132,13 +160,22 @@ async def main():
     parser.add_argument('--cashQty', type=float, help='USD amount to spend (REQUIRED for Crypto)')
     parser.add_argument('--qty', type=float, help='Number of shares to buy (REQUIRED for Stocks)')
     parser.add_argument('--stopPct', type=float, default=1.0, help='Stop loss percentage (e.g., 1.0 for 1%%)')
+    parser.add_argument('--trailingPct', type=float, default=2.0, help='Trailing stop percentage (e.g., 2.0 for 2%%)')
     parser.add_argument('--longAccount', type=str, required=True, help='Account for LONG leg')
     parser.add_argument('--shortAccount', type=str, required=True, help='Account for SHORT leg')
     parser.add_argument('--port', type=int, default=7497, help='TWS/Gateway port')
 
     args = parser.parse_args()
+    config['trailing_pct'] = args.trailingPct
+    config['long_account'] = args.longAccount
+    config['short_account'] = args.shortAccount
+
+    # Update start time immediately before connecting
+    global script_start_time
+    script_start_time = datetime.now(timezone.utc)
 
     ib = IB()
+    config['ib'] = ib # Store for callbacks
     # Attach global handlers
     ib.errorEvent += onError
     ib.commissionReportEvent += onCommissionReport
