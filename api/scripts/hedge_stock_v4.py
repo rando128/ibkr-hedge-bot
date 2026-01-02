@@ -7,21 +7,10 @@ from ib_insync import IB, Stock, Crypto, MarketOrder, StopOrder, Order, TagValue
 # MANDATORY: Patch asyncio for ib_insync
 util.patchAsyncio()
 
-# Tracks when the script started to ignore historical fills
+# Tracks when the script started
 script_start_time = datetime.now(timezone.utc)
 
-def onError(trade, reqId, errorCode, errorString, advancedOrderRejectJson=""):
-    """
-    Improved error handler that filters system info and handles None values.
-    """
-    if reqId == -1:
-        return
-
-    msg = errorString if errorString else errorCode
-    code = errorCode if errorString else "INFO"
-    print(f"\n[IBKR {code}]: {msg} (reqId={reqId})")
-
-# Global state to manage the two legs, P&L, and parameters
+# Global state to manage the legs and P&L
 active_trades = {
     'long': None,
     'short': None
@@ -32,24 +21,26 @@ pnl_stats = {
     'total_sells': 0.0,     # Sum of all SELL amounts (cash in)
     'total_commission': 0.0,
     'fills': [],
-    'symbol': ''
+    'symbol': '',
+    'min_tick': 0.01        # Will be updated from contract details
 }
 
 config = {
-    'trailing_pct': 2.0,    # Default trailing percentage
-    'ib': None,             # Will store the IB instance
+    'trailing_pct': 2.0,
+    'ib': None,
     'long_account': '',
     'short_account': ''
 }
 
-def report_pnl():
-    """
-    Calculates and prints the combined P&L across all accounts.
-    """
-    net_pnl = pnl_stats['total_sells'] - pnl_stats['total_buys'] - pnl_stats['total_commission']
+def onError(trade, reqId, errorCode, errorString, advancedOrderRejectJson=""):
+    if reqId == -1: return
+    msg = errorString if errorString else errorCode
+    code = errorCode if errorString else "INFO"
+    print(f"\n[IBKR {code}]: {msg} (reqId={reqId})")
 
-    num_fills = len(pnl_stats['fills'])
-    status = "INTERIM" if num_fills < 4 else "FINAL"
+def report_pnl(is_final=False):
+    net_pnl = pnl_stats['total_sells'] - pnl_stats['total_buys'] - pnl_stats['total_commission']
+    status = "FINAL" if is_final else "INTERIM"
 
     print(f"\n========================================")
     print(f"{status} HEDGE P&L REPORT ({pnl_stats['symbol']})")
@@ -59,316 +50,164 @@ def report_pnl():
     print(f"Total Commissions:      {pnl_stats['total_commission']:.2f}")
     print(f"----------------------------------------")
     print(f"NET REALIZED P&L:       {net_pnl:.2f}")
-    if num_fills < 4:
-        print(f"STATUS: CYCLE INCOMPLETE ({num_fills}/4 fills)")
-    else:
-        print(f"STATUS: FULL HEDGE CYCLE COMPLETED")
+    print(f"STATUS: {'CLOSED' if is_final else 'OPEN'}")
     print(f"========================================\n")
 
 def onCommissionReport(trade, fill, report):
-    """
-    Callback when IBKR reports the actual commission for a fill.
-    """
-    # Only process commissions for fills we have tracked in this session
-    if fill not in pnl_stats['fills']:
-        return
-
+    if fill not in pnl_stats['fills']: return
     pnl_stats['total_commission'] += report.commission
-    print(f"[COMMISSION]: {report.commission:.2f} {report.currency} for {trade.contract.symbol}")
-
-    # Only report P&L at the very end (4 fills)
-    if len(pnl_stats['fills']) == 4:
-        report_pnl()
+    print(f"[{datetime.now().strftime('%H:%M:%S')}] [COMMISSION]: {report.commission:.2f} {report.currency}")
 
 def onTrailingStopStatus(trade):
-    """
-    Called when the Trailing Stop order status or price changes.
-    """
     status = trade.orderStatus
-    # IBKR stores the dynamic trigger price in different fields depending on state.
-    # We check multiple locations safely.
     curr_stop = getattr(status, 'stopPrice', 0)
-    if curr_stop <= 0:
-        curr_stop = getattr(trade.order, 'auxPrice', 0)
+    if curr_stop <= 0: curr_stop = getattr(trade.order, 'auxPrice', 0)
+    price_str = f"{curr_stop:.2f}" if 0 < curr_stop < 1e10 else "Calculating..."
+    print(f"[TRAILING UPDATE] Account: {trade.order.account} | Status: {status.status} | Current Stop: {price_str}")
 
-    # If the order is filled, report the execution price
-    if status.status == 'Filled':
-        print(f"[TRAILING UPDATE] Account: {trade.order.account} | Status: {status.status} | EXECUTED at {status.avgFillPrice:.2f}")
-    else:
-        # Handle IBKR's Double.MAX_VALUE placeholder
-        price_str = f"{curr_stop:.2f}" if 0 < curr_stop < 1e10 else "Calculating..."
-        print(f"[TRAILING UPDATE] Account: {trade.order.account} | Status: {status.status} | Current Stop: {price_str}")
-
-def onStopLossFill(trade, fill):
-    """
-    Triggered when one of the Stop Losses is filled.
-    """
+async def onStopLossFill(trade, fill):
     now_str = datetime.now().strftime("%H:%M:%S")
     print(f"\n>>>> [{now_str}] STOP LOSS TRIGGERED on {trade.order.account} <<<<")
 
-    # identify the surviving leg
     hit_leg = 'long' if trade.order.account == config['long_account'] else 'short'
     surviving_leg = 'short' if hit_leg == 'long' else 'long'
     surviving_trade = active_trades[surviving_leg]
 
     if surviving_trade and not surviving_trade.isDone():
-        status = surviving_trade.orderStatus.status
-        # Use account info to determine correct label for logging
         acc = surviving_trade.order.account
         label = "LONG" if acc == config['long_account'] else "SHORT"
 
-        if status not in ('PendingCancel', 'Cancelled', 'ApiCancelled'):
-            print(f"Cancelling surviving Stop Loss ({status}) on {acc} ({label})...")
-            config['ib'].cancelOrder(surviving_trade.order)
+        print(f"Cancelling surviving Stop Loss on {acc} ({label})...")
+        config['ib'].cancelOrder(surviving_trade.order)
 
-        # Switch to Trailing Stop (2%)
-        action = surviving_trade.order.action # Keep same exit direction
+        # 4. Wait until cancelled
+        while not surviving_trade.isDone():
+            await asyncio.sleep(0.1)
+            config['ib'].waitOnUpdate()
+
+        # Place Trailing Stop
+        action = 'SELL' if label == "LONG" else 'BUY'
         qty = surviving_trade.order.totalQuantity
-
-        # Calculate initial estimated trail price for logging
-        # We use the price of the Stop Loss fill as our current market price proxy
         market_price = fill.execution.price
 
-        # Determine tick for rounding
-        leg_tick = 0.05 if (market_price >= 200 and trade.contract.currency == 'EUR') else 0.01
+        tick = pnl_stats['min_tick']
+        if label == "LONG":
+            trail_price = math.floor(market_price * (1 - (config['trailing_pct'] / 100)) / tick) * tick
+        else:
+            trail_price = math.ceil(market_price * (1 + (config['trailing_pct'] / 100)) / tick) * tick
 
-        trail_price = 0.0
-        if action == 'SELL': # Closing a LONG
-            trail_price = math.floor(market_price * (1 - (config['trailing_pct'] / 100)) / leg_tick) * leg_tick
-        else: # BUY to cover a SHORT
-            trail_price = math.ceil(market_price * (1 + (config['trailing_pct'] / 100)) / leg_tick) * leg_tick
-
-        print(f"Switching {label} leg to {config['trailing_pct']}% Trailing Stop on account {acc} (Estimated initial stop: {trail_price:.2f})...")
-
+        print(f"Switching {label} leg to {config['trailing_pct']}% Trailing Stop (Est: {trail_price:.2f})...")
         trail_order = Order(
-            action=action,
-            totalQuantity=qty,
-            orderType='TRAIL',
-            trailingPercent=config['trailing_pct'],
-            account=acc,
-            tif='GTC',
-            outsideRth=True
+            action=action, totalQuantity=qty, orderType='TRAIL',
+            trailingPercent=config['trailing_pct'], account=acc, tif='GTC', outsideRth=True
         )
-        trail_trade = config['ib'].placeOrder(trade.contract, trail_order)
-        # Attach the status listener to see price updates
-        trail_trade.statusEvent += onTrailingStopStatus
-        # Attach to global tracker so we can wait for it
-        active_trades[surviving_leg] = trail_trade
-        print("Trailing Stop submitted. Protection transitioned.")
+        t_trade = config['ib'].placeOrder(trade.contract, trail_order)
+        t_trade.statusEvent += onTrailingStopStatus
+        active_trades[surviving_leg] = t_trade
 
 def onFill(trade, fill):
-    """
-    Callback for all order fills. Tracks P&L across both legs.
-    """
     exec = fill.execution
-    amount = exec.shares * exec.price
-    action = trade.order.action
-    account = trade.order.account
-    now_str = datetime.now().strftime("%H:%M:%S")
-
-    print(f"\n--- [{now_str}] EVENT: ORDER FILLED ---")
-    # Determine leg type for better logging
-    leg_type = "LONG" if account == config['long_account'] else "SHORT"
-    role = "ENTRY" if ((action == 'BUY' and leg_type == 'LONG') or (action == 'SELL' and leg_type == 'SHORT')) else "EXIT"
-
-    print(f"[{leg_type} {role}] Account: {account} | {trade.contract.symbol} {action} {exec.shares} @ {exec.price}")
-
-    # Cash-flow logic:
-    # BUY is always money leaving the account (cost)
-    # SELL is always money entering the account (revenue)
-    if action == 'BUY':
-        pnl_stats['total_buys'] += amount
-    else: # SELL
-        pnl_stats['total_sells'] += amount
-
     pnl_stats['fills'].append(fill)
+    if trade.order.action == 'BUY': pnl_stats['total_buys'] += exec.shares * exec.price
+    else: pnl_stats['total_sells'] += exec.shares * exec.price
 
-    if trade.isDone():
-        print(f"Trade {trade.order.orderId} finished. Status: {trade.orderStatus.status}")
+    leg = "LONG" if trade.order.account == config['long_account'] else "SHORT"
+    role = "ENTRY" if trade.order.orderId in [active_trades['l_ent_id'], active_trades['s_ent_id']] else "EXIT"
+    print(f"--- [{datetime.now().strftime('%H:%M:%S')}] {leg} {role} FILLED: {exec.shares} @ {exec.price} ---")
 
-        # A full cycle requires exactly 4 fills
-        num_fills = len(pnl_stats['fills'])
-
-        if num_fills == 4:
-            print(f">>> [{now_str}] ALL LEGS CLOSED. HEDGE COMPLETE.")
-            report_pnl()
-
-    print(f"---------------------------\n")
+    # Trigger transition if it's a stop loss fill
+    if role == "EXIT" and trade.order.orderType == 'STP':
+        asyncio.create_task(onStopLossFill(trade, fill))
 
 async def main():
-    parser = argparse.ArgumentParser(description='Place a buy order with an automated stop loss.')
-    parser.add_argument('--symbol', type=str, required=True, help='Ticker symbol (e.g., AAPL, AIR, BTC)')
-    parser.add_argument('--cashQty', type=float, help='USD amount to spend (REQUIRED for Crypto)')
-    parser.add_argument('--qty', type=float, help='Number of shares to buy (REQUIRED for Stocks)')
-    parser.add_argument('--stopPct', type=float, default=1.0, help='Stop loss percentage (e.g., 1.0 for 1%%)')
-    parser.add_argument('--trailingPct', type=float, default=2.0, help='Trailing stop percentage (e.g., 2.0 for 2%%)')
-    parser.add_argument('--longAccount', type=str, required=True, help='Account for LONG leg')
-    parser.add_argument('--shortAccount', type=str, required=True, help='Account for SHORT leg')
-    parser.add_argument('--useAlgo', action='store_true', help='Use IBKR Adaptive Algo (primarily US Stocks)')
-    parser.add_argument('--port', type=int, default=7497, help='TWS/Gateway port')
-
+    parser = argparse.ArgumentParser()
+    parser.add_argument('--symbol', required=True)
+    parser.add_argument('--qty', type=float, required=True)
+    parser.add_argument('--stopPct', type=float, default=1.0)
+    parser.add_argument('--trailingPct', type=float, default=2.0)
+    parser.add_argument('--longAccount', required=True)
+    parser.add_argument('--shortAccount', required=True)
+    parser.add_argument('--useAlgo', action='store_true')
+    parser.add_argument('--port', type=int, default=7497)
     args = parser.parse_args()
-    config['trailing_pct'] = args.trailingPct
-    config['long_account'] = args.longAccount
-    config['short_account'] = args.shortAccount
 
-    # Update start time slightly in the past to ensure we don't miss the first immediate fill
-    global script_start_time
-    script_start_time = datetime.now(timezone.utc).replace(second=0, microsecond=0)
-
+    config.update({'trailing_pct': args.trailingPct, 'long_account': args.longAccount, 'short_account': args.shortAccount})
     ib = IB()
-    config['ib'] = ib # Store for callbacks
-    # Attach global handlers
+    config['ib'] = ib
     ib.errorEvent += onError
     ib.commissionReportEvent += onCommissionReport
+
     try:
-        print(f"Connecting to IBKR on port {args.port}...")
-        ib.connect('127.0.0.1', args.port, clientId=10)
-        print("Connected!")
+        await ib.connectAsync('127.0.0.1', args.port, clientId=10)
 
-        # 1. Determine Contract Type
-        # If it's a known crypto or 3-letter symbol we might need more logic,
-        # but we'll try to qualify it as a Stock first, then Crypto.
-        print(f"Searching for contract: {args.symbol}...")
-
-        # Simple heuristic: if symbol is BTC, ETH etc, use Crypto.
-        # Otherwise try Stock SMART.
-        if args.symbol.upper() in ['BTC', 'ETH', 'LTC', 'BCH']:
-            contract = Crypto(symbol=args.symbol.upper(), exchange='PAXOS', currency='USD')
-        elif args.symbol.upper() == 'AIR':
-             contract = Stock(symbol='AIR', exchange='SMART', primaryExchange='SBF', currency='EUR')
+        # Contract setup
+        if args.symbol.upper() == 'AIR':
+            contract = Stock('AIR', 'SMART', 'SBF', 'EUR')
         else:
-            contract = Stock(symbol=args.symbol.upper(), exchange='SMART', currency='USD')
-
-        ib.qualifyContracts(contract)
-        print(f"Contract qualified: {contract}")
+            contract = Stock(args.symbol.upper(), 'SMART', 'USD')
+        await ib.qualifyContractsAsync(contract)
         pnl_stats['symbol'] = contract.symbol
 
-        # 2. Determine Contract Details (Tick Size)
-        print("Fetching contract details for tick size...")
         details = await ib.reqContractDetailsAsync(contract)
-        min_tick = 0.01 # Default
-        if details:
-            min_tick = details[0].minTick
+        pnl_stats['min_tick'] = details[0].minTick if details else 0.01
+        tick = pnl_stats['min_tick']
 
-        is_paxos = (contract.exchange == 'PAXOS')
-        active_stop_losses = []
+        # 1. Concurrent Entries
+        print(f"\n>>> SUBMITTING CONCURRENT ENTRIES (Qty: {args.qty})...")
+        l_ord = MarketOrder('BUY', args.qty, account=args.longAccount, tif='GTC')
+        s_ord = MarketOrder('SELL', args.qty, account=args.shortAccount, tif='GTC')
+        if args.useAlgo and contract.currency == 'USD':
+            for o in [l_ord, s_ord]:
+                o.algoStrategy = 'Adaptive'
+                o.algoParams = [TagValue('priority', 'Normal')]
 
-        # ---------------------------------------------------------
-        # LEG 1: LONG (BUY) on longAccount
-        # ---------------------------------------------------------
-        print(f"\n>>> EXECUTING LONG LEG on {args.longAccount}...")
-        if is_paxos:
-            if not args.cashQty:
-                print("Error: --cashQty is required for Crypto.")
-                return
-            long_order = MarketOrder(action='BUY', totalQuantity=0, account=args.longAccount, cashQty=args.cashQty, tif='IOC')
-        else:
-            if not args.qty:
-                print("Error: --qty is required for Stocks.")
-                return
-            long_order = MarketOrder(action='BUY', totalQuantity=args.qty, account=args.longAccount, tif='GTC')
+        l_trade = ib.placeOrder(contract, l_ord)
+        s_trade = ib.placeOrder(contract, s_ord)
+        l_trade.fillEvent += onFill
+        s_trade.fillEvent += onFill
+        active_trades['l_ent_id'] = l_ord.orderId
+        active_trades['s_ent_id'] = s_ord.orderId
 
-            # Use Adaptive Algo only if explicitly requested
-            if args.useAlgo and contract.currency == 'USD':
-                print(f"Applying Adaptive Algo (Normal priority)...")
-                long_order.algoStrategy = 'Adaptive'
-                long_order.algoParams = [TagValue('priority', 'Normal')]
-
-        long_trade = ib.placeOrder(contract, long_order)
-        long_trade.fillEvent += onFill
-
-        while not long_trade.isDone():
+        print("Waiting for both entries to fill...")
+        while not (l_trade.isDone() and s_trade.isDone()):
             await asyncio.sleep(0.5)
             ib.waitOnUpdate()
 
-        if long_trade.orderStatus.status == 'Filled':
-            avg_price = long_trade.orderStatus.avgFillPrice
-            print(f"--- [LONG ENTRY] FILLED at {avg_price} ---")
+        # 3. Place Stop Losses after both fills
+        print("\n>>> BOTH ENTRIES DONE. PLACING PROTECTION...")
+        l_qty, s_qty = l_trade.orderStatus.filled, s_trade.orderStatus.filled
+        l_price, s_price = l_trade.orderStatus.avgFillPrice, s_trade.orderStatus.avgFillPrice
 
-            # Compliance for high-priced Euronext
-            leg_tick = 0.05 if (avg_price >= 200 and contract.currency == 'EUR') else min_tick
+        # Long SL (Sell Stop)
+        l_sl_p = math.floor(l_price * (1 - args.stopPct/100) / tick) * tick
+        l_sl_o = StopOrder('SELL', l_qty, round(l_sl_p, 2), account=args.longAccount, tif='GTC', outsideRth=True)
+        # Short SL (Buy Stop)
+        s_sl_p = math.ceil(s_price * (1 + args.stopPct/100) / tick) * tick
+        s_sl_o = StopOrder('BUY', s_qty, round(s_sl_p, 2), account=args.shortAccount, tif='GTC', outsideRth=True)
 
-            # Stop Loss: BUY price -> SELL STOP below
-            sl_price = math.floor(avg_price * (1 - (args.stopPct / 100)) / leg_tick) * leg_tick
-            sl_price = round(sl_price, 2)
+        active_trades['long'] = ib.placeOrder(contract, l_sl_o)
+        active_trades['short'] = ib.placeOrder(contract, s_sl_o)
+        for t in [active_trades['long'], active_trades['short']]: t.fillEvent += onFill
 
-            print(f"Placing LONG Stop Loss at {sl_price}...")
-            sl_long = StopOrder(action='SELL', totalQuantity=long_trade.orderStatus.filled, stopPrice=sl_price, account=args.longAccount, tif='GTC', outsideRth=True)
-            sl_long_trade = ib.placeOrder(contract, sl_long)
-            sl_long_trade.fillEvent += onFill
-            sl_long_trade.fillEvent += onStopLossFill # Logic Switcher
-            active_trades['long'] = sl_long_trade
-
-        # ---------------------------------------------------------
-        # LEG 2: SHORT (SELL) on shortAccount
-        # ---------------------------------------------------------
-        print(f"\n>>> EXECUTING SHORT LEG on {args.shortAccount}...")
-        if is_paxos:
-            # PAXOS Shorting is usually not supported in the same way, but we follow the logic
-            short_order = MarketOrder(action='SELL', totalQuantity=args.qty or 0, account=args.shortAccount, tif='IOC')
-        else:
-            short_order = MarketOrder(action='SELL', totalQuantity=args.qty, account=args.shortAccount, tif='GTC')
-
-            # Use Adaptive Algo only if explicitly requested
-            if args.useAlgo and contract.currency == 'USD':
-                print(f"Applying Adaptive Algo (Normal priority)...")
-                short_order.algoStrategy = 'Adaptive'
-                short_order.algoParams = [TagValue('priority', 'Normal')]
-
-        short_trade = ib.placeOrder(contract, short_order)
-        short_trade.fillEvent += onFill
-
-        while not short_trade.isDone():
-            await asyncio.sleep(0.5)
+        print("Waiting for Stop Losses to reach live state...")
+        while any(t.orderStatus.status == 'PendingSubmit' for t in [active_trades['long'], active_trades['short']]):
+            await asyncio.sleep(0.1)
             ib.waitOnUpdate()
 
-        if short_trade.orderStatus.status == 'Filled':
-            avg_price = short_trade.orderStatus.avgFillPrice
-            print(f"--- [SHORT ENTRY] FILLED at {avg_price} ---")
-
-            leg_tick = 0.05 if (avg_price >= 200 and contract.currency == 'EUR') else min_tick
-
-            # Stop Loss: SELL price -> BUY STOP above
-            sl_price = math.ceil(avg_price * (1 + (args.stopPct / 100)) / leg_tick) * leg_tick
-            sl_price = round(sl_price, 2)
-
-            print(f"Placing SHORT Stop Loss at {sl_price}...")
-            sl_short = StopOrder(action='BUY', totalQuantity=short_trade.orderStatus.filled, stopPrice=sl_price, account=args.shortAccount, tif='GTC', outsideRth=True)
-            sl_short_trade = ib.placeOrder(contract, sl_short)
-            sl_short_trade.fillEvent += onFill
-            sl_short_trade.fillEvent += onStopLossFill # Logic Switcher
-            active_trades['short'] = sl_short_trade
-
-        # ---------------------------------------------------------
-        # 6. Final confirmation & Monitoring
-        # ---------------------------------------------------------
-        print("\nAll legs submitted. Waiting for Stop Losses to reach live state...")
-        for sl_t in [active_trades['long'], active_trades['short']]:
-            if not sl_t: continue
-            while sl_t.orderStatus.status == 'PendingSubmit':
-                await asyncio.sleep(0.1)
-                ib.waitOnUpdate()
-
-        print("\nBoth Stop Losses are ACTIVE. Listening for events... (Ctrl+C to stop)")
-        # Continue listening until both legs in active_trades are Done
-        while any(t and not t.isDone() for t in active_trades.values()):
-            await asyncio.sleep(1)
+        # 5. Monitor until positions are FLAT
+        print("\nHedge is ACTIVE. Monitoring positions...")
+        while True:
+            await asyncio.sleep(2)
             ib.waitOnUpdate()
+            pos = [p for p in ib.positions() if p.contract.conId == contract.conId and p.account in [args.longAccount, args.shortAccount]]
+            if not pos or all(p.position == 0 for p in pos):
+                break
 
-        # Give a small grace period for the final commission report to arrive
-        print("\nAll trades completed. Waiting for final data sync...")
-        await asyncio.sleep(2)
-        ib.waitOnUpdate()
+        print("\n>>> ALL POSITIONS CLOSED.")
+        await asyncio.sleep(2) # Final sync
+        report_pnl(is_final=True)
 
-        # FINAL Guaranteed Report
-        print("\n>>> ALL LEGS CLOSED. HEDGE COMPLETE.")
-        report_pnl()
-
-    except Exception as e:
-        print(f"An error occurred: {e}")
     finally:
-        print("Closing connection...")
         ib.disconnect()
 
 if __name__ == '__main__':
