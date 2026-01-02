@@ -10,11 +10,13 @@ util.patchAsyncio()
 # Tracks when the script started
 script_start_time = datetime.now(timezone.utc)
 
-# Global state to manage the legs and P&L
+# Global state to manage the legs, P&L, and order roles
 active_trades = {
     'long': None,
     'short': None
 }
+
+order_role_map = {} # Maps orderId -> "LONG_ENTRY", "SHORT_SL", etc.
 
 pnl_stats = {
     'total_buys': 0.0,      # Sum of all BUY amounts (cash out)
@@ -62,8 +64,12 @@ def onTrailingStopStatus(trade):
     status = trade.orderStatus
     curr_stop = getattr(status, 'stopPrice', 0)
     if curr_stop <= 0: curr_stop = getattr(trade.order, 'auxPrice', 0)
-    price_str = f"{curr_stop:.2f}" if 0 < curr_stop < 1e10 else "Calculating..."
-    print(f"[TRAILING UPDATE] Account: {trade.order.account} | Status: {status.status} | Current Stop: {price_str}")
+
+    if status.status == 'Filled':
+        print(f"[TRAILING UPDATE] Account: {trade.order.account} | Status: {status.status} | EXECUTED at {status.avgFillPrice}")
+    else:
+        price_str = str(curr_stop) if 0 < curr_stop < 1e10 else "Calculating..."
+        print(f"[TRAILING UPDATE] Account: {trade.order.account} | Status: {status.status} | Current Stop: {price_str}")
 
 async def onStopLossFill(trade, fill):
     now_str = datetime.now().strftime("%H:%M:%S")
@@ -85,6 +91,12 @@ async def onStopLossFill(trade, fill):
             await asyncio.sleep(0.1)
             config['ib'].waitOnUpdate()
 
+        # Verify it was actually cancelled and not filled during the wait
+        st = surviving_trade.orderStatus.status
+        if st not in ('Cancelled', 'ApiCancelled'):
+            print(f"Surviving Stop Loss was not cancelled (Status: {st}). It likely filled. Not placing trailing stop.")
+            return
+
         # Place Trailing Stop
         action = 'SELL' if label == "LONG" else 'BUY'
         qty = surviving_trade.order.totalQuantity
@@ -96,7 +108,7 @@ async def onStopLossFill(trade, fill):
         else:
             trail_price = math.ceil(market_price * (1 + (config['trailing_pct'] / 100)) / tick) * tick
 
-        print(f"Switching {label} leg to {config['trailing_pct']}% Trailing Stop (Est: {trail_price:.2f})...")
+        print(f"Switching {label} leg to {config['trailing_pct']}% Trailing Stop (Est: {trail_price})...")
         trail_order = Order(
             action=action, totalQuantity=qty, orderType='TRAIL',
             trailingPercent=config['trailing_pct'], account=acc, tif='GTC', outsideRth=True
@@ -105,18 +117,21 @@ async def onStopLossFill(trade, fill):
         t_trade.statusEvent += onTrailingStopStatus
         active_trades[surviving_leg] = t_trade
 
+        # Register the role
+        order_role_map[trail_order.orderId] = f"{label}_TRAIL"
+
 def onFill(trade, fill):
     exec = fill.execution
     pnl_stats['fills'].append(fill)
     if trade.order.action == 'BUY': pnl_stats['total_buys'] += exec.shares * exec.price
     else: pnl_stats['total_sells'] += exec.shares * exec.price
 
-    leg = "LONG" if trade.order.account == config['long_account'] else "SHORT"
-    role = "ENTRY" if trade.order.orderId in [active_trades['l_ent_id'], active_trades['s_ent_id']] else "EXIT"
-    print(f"--- [{datetime.now().strftime('%H:%M:%S')}] {leg} {role} FILLED: {exec.shares} @ {exec.price} ---")
+    account = trade.order.account
+    role = order_role_map.get(trade.order.orderId, "UNKNOWN")
+    print(f"--- [{datetime.now().strftime('%H:%M:%S')}] {role} FILLED on {account}: {exec.shares} @ {exec.price} ---")
 
     # Trigger transition if it's a stop loss fill
-    if role == "EXIT" and trade.order.orderType == 'STP':
+    if "SL" in role:
         asyncio.create_task(onStopLossFill(trade, fill))
 
 async def main():
@@ -163,10 +178,13 @@ async def main():
 
         l_trade = ib.placeOrder(contract, l_ord)
         s_trade = ib.placeOrder(contract, s_ord)
+
+        # Immediate mapping of roles using orderId from the trade objects
+        order_role_map[l_trade.order.orderId] = "LONG_ENTRY"
+        order_role_map[s_trade.order.orderId] = "SHORT_ENTRY"
+
         l_trade.fillEvent += onFill
         s_trade.fillEvent += onFill
-        active_trades['l_ent_id'] = l_ord.orderId
-        active_trades['s_ent_id'] = s_ord.orderId
 
         print("Waiting for both entries to fill...")
         while not (l_trade.isDone() and s_trade.isDone()):
@@ -180,19 +198,34 @@ async def main():
 
         # Long SL (Sell Stop)
         l_sl_p = math.floor(l_price * (1 - args.stopPct/100) / tick) * tick
-        l_sl_o = StopOrder('SELL', l_qty, round(l_sl_p, 2), account=args.longAccount, tif='GTC', outsideRth=True)
+        l_sl_p = round(l_sl_p, 4)
+        print(f"Placing LONG Stop Loss on {args.longAccount} at {l_sl_p}...")
+        l_sl_o = StopOrder('SELL', l_qty, l_sl_p, account=args.longAccount, tif='GTC', outsideRth=True)
+
         # Short SL (Buy Stop)
         s_sl_p = math.ceil(s_price * (1 + args.stopPct/100) / tick) * tick
-        s_sl_o = StopOrder('BUY', s_qty, round(s_sl_p, 2), account=args.shortAccount, tif='GTC', outsideRth=True)
+        s_sl_p = round(s_sl_p, 4)
+        print(f"Placing SHORT Stop Loss on {args.shortAccount} at {s_sl_p}...")
+        s_sl_o = StopOrder('BUY', s_qty, s_sl_p, account=args.shortAccount, tif='GTC', outsideRth=True)
 
         active_trades['long'] = ib.placeOrder(contract, l_sl_o)
         active_trades['short'] = ib.placeOrder(contract, s_sl_o)
+
+        # Register Stop Loss roles
+        order_role_map[active_trades['long'].order.orderId] = "LONG_SL"
+        order_role_map[active_trades['short'].order.orderId] = "SHORT_SL"
+
         for t in [active_trades['long'], active_trades['short']]: t.fillEvent += onFill
 
         print("Waiting for Stop Losses to reach live state...")
-        while any(t.orderStatus.status == 'PendingSubmit' for t in [active_trades['long'], active_trades['short']]):
+        armed_statuses = {'PreSubmitted', 'Submitted'}
+        while any(t.orderStatus.status not in armed_statuses for t in [active_trades['long'], active_trades['short']]):
             await asyncio.sleep(0.1)
             ib.waitOnUpdate()
+            # Safety: If any order becomes Inactive or Rejected, stop waiting
+            if any(t.orderStatus.status in ('Inactive', 'Rejected') for t in [active_trades['long'], active_trades['short']]):
+                print("One or more Stop Loss orders were rejected or became Inactive.")
+                break
 
         # 5. Monitor until positions are FLAT
         print("\nHedge is ACTIVE. Monitoring positions...")
@@ -204,6 +237,14 @@ async def main():
                 break
 
         print("\n>>> ALL POSITIONS CLOSED.")
+
+        # 6. Defensive Cleanup of any orphan orders
+        print("Cleaning up any remaining orphan orders...")
+        for t in ib.openTrades():
+            if t.contract.conId == contract.conId and t.order.account in [args.longAccount, args.shortAccount]:
+                print(f"Cancelling orphan {t.order.orderType} order {t.order.orderId} on {t.order.account}...")
+                ib.cancelOrder(t.order)
+
         await asyncio.sleep(2) # Final sync
         report_pnl(is_final=True)
 
