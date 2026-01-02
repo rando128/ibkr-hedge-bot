@@ -304,8 +304,8 @@ async def main():
 
             # 1. Concurrent Entries
             print(f"\n>>> SUBMITTING CONCURRENT ENTRIES (Qty: {args.qty})...")
-            l_ord = MarketOrder('BUY', args.qty, account=args.longAccount, tif='GTC')
-            s_ord = MarketOrder('SELL', args.qty, account=args.shortAccount, tif='GTC')
+            l_ord = MarketOrder('BUY', args.qty, account=args.longAccount, tif='GTC', orderRef=f"C{config['cycle_count']}_LONG_ENTRY")
+            s_ord = MarketOrder('SELL', args.qty, account=args.shortAccount, tif='GTC', orderRef=f"C{config['cycle_count']}_SHORT_ENTRY")
             if args.useAlgo and contract.currency == 'USD':
                 for o in [l_ord, s_ord]:
                     o.algoStrategy = 'Adaptive'
@@ -344,7 +344,7 @@ async def main():
                         qty = pos[0].position
                         action = 'SELL' if qty > 0 else 'BUY'
                         print(f"Flattening position on {acc}: {abs(qty)} shares...")
-                        ib.placeOrder(contract, MarketOrder(action, abs(qty), account=acc))
+                        ib.placeOrder(contract, MarketOrder(action, abs(qty), account=acc, orderRef=f"C{config['cycle_count']}_PANIC_FLATTEN"))
 
                 # Orphan Cleanup
                 print("Cleaning up orphan orders...")
@@ -376,12 +376,12 @@ async def main():
             # Long SL (Sell Stop)
             l_sl_p = q_floor(l_price * (1 - args.stopPct/100), tick)
             print(f"Placing LONG Stop Loss on {args.longAccount} at {l_sl_p:.4f}...")
-            l_sl_o = StopOrder('SELL', l_qty, l_sl_p, account=args.longAccount, tif='GTC', outsideRth=True)
+            l_sl_o = StopOrder('SELL', l_qty, l_sl_p, account=args.longAccount, tif='GTC', outsideRth=True, orderRef=f"C{config['cycle_count']}_LONG_SL")
 
             # Short SL (Buy Stop)
             s_sl_p = q_ceil(s_price * (1 + args.stopPct/100), tick)
             print(f"Placing SHORT Stop Loss on {args.shortAccount} at {s_sl_p:.4f}...")
-            s_sl_o = StopOrder('BUY', s_qty, s_sl_p, account=args.shortAccount, tif='GTC', outsideRth=True)
+            s_sl_o = StopOrder('BUY', s_qty, s_sl_p, account=args.shortAccount, tif='GTC', outsideRth=True, orderRef=f"C{config['cycle_count']}_SHORT_SL")
 
             active_trades['long'] = ib.placeOrder(contract, l_sl_o)
             active_trades['short'] = ib.placeOrder(contract, s_sl_o)
@@ -414,7 +414,7 @@ async def main():
                         qty = pos[0].position
                         action = 'SELL' if qty > 0 else 'BUY'
                         print(f"Flattening position on {acc}: {abs(qty)} shares...")
-                        ib.placeOrder(contract, MarketOrder(action, abs(qty), account=acc))
+                        ib.placeOrder(contract, MarketOrder(action, abs(qty), account=acc, orderRef=f"C{config['cycle_count']}_PROT_FAIL_FLATTEN"))
 
                 # Defensive Cleanup of any orphan orders
                 print("Cleaning up orphan orders...")
