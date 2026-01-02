@@ -35,8 +35,9 @@ async def main():
     parser.add_argument('--symbol', type=str, required=True, help='Ticker symbol (e.g., AAPL, AIR, BTC)')
     parser.add_argument('--cashQty', type=float, help='USD amount to spend (REQUIRED for Crypto)')
     parser.add_argument('--qty', type=float, help='Number of shares to buy (REQUIRED for Stocks)')
-    parser.add_argument('--stopPct', type=float, default=1.0, help='Stop loss percentage below entry (e.g., 1.0 for 1%%)')
-    parser.add_argument('--account', type=str, default='DUP073403', help='IBKR Account ID')
+    parser.add_argument('--stopPct', type=float, default=1.0, help='Stop loss percentage (e.g., 1.0 for 1%%)')
+    parser.add_argument('--longAccount', type=str, required=True, help='Account for LONG leg')
+    parser.add_argument('--shortAccount', type=str, required=True, help='Account for SHORT leg')
     parser.add_argument('--port', type=int, default=7497, help='TWS/Gateway port')
 
     args = parser.parse_args()
@@ -66,112 +67,103 @@ async def main():
         ib.qualifyContracts(contract)
         print(f"Contract qualified: {contract}")
 
-        # 2. Define Primary Order
+        # 2. Determine Contract Details (Tick Size)
+        print("Fetching contract details for tick size...")
+        details = await ib.reqContractDetailsAsync(contract)
+        min_tick = 0.01 # Default
+        if details:
+            min_tick = details[0].minTick
+
         is_paxos = (contract.exchange == 'PAXOS')
+        active_stop_losses = []
 
+        # ---------------------------------------------------------
+        # LEG 1: LONG (BUY) on longAccount
+        # ---------------------------------------------------------
+        print(f"\n>>> EXECUTING LONG LEG on {args.longAccount}...")
         if is_paxos:
-            # Crypto BUY: Use cashQty and IOC
             if not args.cashQty:
-                print("Error: --cashQty is required for Crypto contracts.")
+                print("Error: --cashQty is required for Crypto.")
                 return
-            order = MarketOrder(action='BUY', totalQuantity=0, account=args.account)
-            order.cashQty = args.cashQty
-            order.tif = 'IOC'
+            long_order = MarketOrder(action='BUY', totalQuantity=0, account=args.longAccount, cashQty=args.cashQty, tif='IOC')
         else:
-            # Stock BUY: Use manual qty
             if not args.qty:
-                print("Error: --qty is required for Stock contracts.")
+                print("Error: --qty is required for Stocks.")
                 return
-
-            order = MarketOrder(action='BUY', totalQuantity=args.qty, account=args.account)
-
-            # Use Adaptive Algo for US Stocks
+            long_order = MarketOrder(action='BUY', totalQuantity=args.qty, account=args.longAccount, tif='GTC')
             if contract.currency == 'USD':
-                print(f"Applying Adaptive Algo (Normal priority)...")
-                order.algoStrategy = 'Adaptive'
-                order.algoParams = [TagValue('priority', 'Normal')]
+                long_order.algoStrategy = 'Adaptive'
+                long_order.algoParams = [TagValue('priority', 'Normal')]
 
-            order.tif = 'GTC'
+        long_trade = ib.placeOrder(contract, long_order)
+        long_trade.fillEvent += onFill
 
-        # 3. Place Primary Order
-        print(f"Placing Buy Order for {args.symbol}...")
-        trade = ib.placeOrder(contract, order)
-        trade.fillEvent += onFill
+        while not long_trade.isDone():
+            await asyncio.sleep(0.5)
+            ib.waitOnUpdate()
 
-        # 4. Wait for Fill
-        print("Waiting for primary order execution...")
-        while not trade.isDone():
-            await asyncio.sleep(1)
-            if trade.orderStatus.status == 'Inactive':
-                print("Order became Inactive. Likely rejected.")
-                break
+        if long_trade.orderStatus.status == 'Filled':
+            avg_price = long_trade.orderStatus.avgFillPrice
+            # Compliance for high-priced Euronext
+            leg_tick = 0.05 if (avg_price >= 200 and contract.currency == 'EUR') else min_tick
 
-        if trade.orderStatus.status == 'Filled':
-            avg_price = trade.orderStatus.avgFillPrice
-            filled_qty = trade.orderStatus.filled
+            # Stop Loss: BUY price -> SELL STOP below
+            sl_price = math.floor(avg_price * (1 - (args.stopPct / 100)) / leg_tick) * leg_tick
+            sl_price = round(sl_price, 2)
 
-            print(f"\nPrimary Order Filled at {avg_price}. Quantity: {filled_qty}")
+            print(f"Placing LONG Stop Loss at {sl_price}...")
+            sl_long = StopOrder(action='SELL', totalQuantity=long_trade.orderStatus.filled, stopPrice=sl_price, account=args.longAccount, tif='GTC', outsideRth=True)
+            sl_long_trade = ib.placeOrder(contract, sl_long)
+            sl_long_trade.fillEvent += onFill
+            active_stop_losses.append(sl_long_trade)
 
-            # 5. Place Stop Loss Order
-            # FETCH CONTRACT DETAILS FOR MIN TICK (Fix for Error 78110)
-            print("Fetching contract details for tick size...")
-            details = await ib.reqContractDetailsAsync(contract)
-            min_tick = 0.01 # Default
-            if details:
-                min_tick = details[0].minTick
+        # ---------------------------------------------------------
+        # LEG 2: SHORT (SELL) on shortAccount
+        # ---------------------------------------------------------
+        print(f"\n>>> EXECUTING SHORT LEG on {args.shortAccount}...")
+        if is_paxos:
+            # PAXOS Shorting is usually not supported in the same way, but we follow the logic
+            short_order = MarketOrder(action='SELL', totalQuantity=args.qty or 0, account=args.shortAccount, tif='IOC')
+        else:
+            short_order = MarketOrder(action='SELL', totalQuantity=args.qty, account=args.shortAccount, tif='GTC')
+            if contract.currency == 'USD':
+                short_order.algoStrategy = 'Adaptive'
+                short_order.algoParams = [TagValue('priority', 'Normal')]
 
-            # Euronext MiFID II compliance
-            if avg_price >= 200:
-                print(f"Price {avg_price} >= 200. Using 0.05 tick size for compliance.")
-                min_tick = 0.05
-            elif min_tick < 0.01:
-                min_tick = 0.01
+        short_trade = ib.placeOrder(contract, short_order)
+        short_trade.fillEvent += onFill
 
-            stop_price_raw = avg_price * (1 - (args.stopPct / 100))
-            # Round DOWN to nearest tick
-            stop_price = math.floor(stop_price_raw / min_tick) * min_tick
-            stop_price = round(stop_price, 2)
+        while not short_trade.isDone():
+            await asyncio.sleep(0.5)
+            ib.waitOnUpdate()
 
-            print(f"Placing Stop Loss at {stop_price} ({args.stopPct}% below entry, Tick: {min_tick})...")
+        if short_trade.orderStatus.status == 'Filled':
+            avg_price = short_trade.orderStatus.avgFillPrice
+            leg_tick = 0.05 if (avg_price >= 200 and contract.currency == 'EUR') else min_tick
 
-            sl_order = StopOrder(
-                action='SELL',
-                totalQuantity=filled_qty,
-                stopPrice=stop_price,
-                account=args.account
-            )
-            sl_order.tif = 'GTC'
-            sl_order.outsideRth = True
+            # Stop Loss: SELL price -> BUY STOP above
+            sl_price = math.ceil(avg_price * (1 + (args.stopPct / 100)) / leg_tick) * leg_tick
+            sl_price = round(sl_price, 2)
 
-            sl_trade = ib.placeOrder(contract, sl_order)
-            sl_trade.fillEvent += onFill
+            print(f"Placing SHORT Stop Loss at {sl_price}...")
+            sl_short = StopOrder(action='BUY', totalQuantity=short_trade.orderStatus.filled, stopPrice=sl_price, account=args.shortAccount, tif='GTC', outsideRth=True)
+            sl_short_trade = ib.placeOrder(contract, sl_short)
+            sl_short_trade.fillEvent += onFill
+            active_stop_losses.append(sl_short_trade)
 
-            # FORCE SYNC
-            while sl_trade.orderStatus.status == 'PendingSubmit':
+        # ---------------------------------------------------------
+        # 6. Final confirmation & Monitoring
+        # ---------------------------------------------------------
+        print("\nAll legs submitted. Waiting for Stop Losses to reach live state...")
+        for sl_t in active_stop_losses:
+            while sl_t.orderStatus.status == 'PendingSubmit':
                 await asyncio.sleep(0.1)
                 ib.waitOnUpdate()
 
-            print(f"Stop Loss is now ACTIVE. Status: {sl_trade.orderStatus.status}")
-
-            # 6. Keep listening
-            print(f"\nStop Loss is now ACTIVE at {stop_price}.")
-            print("Listening for Stop Loss triggers or status changes... (Ctrl+C to stop)")
-
-            while not sl_trade.isDone():
-                # waitOnUpdate() is crucial; it processes messages and updates statuses
-                await ib.updateEvent
-                if sl_trade.orderStatus.status in ('Submitted', 'PreSubmitted'):
-                    # Only print once when it reaches a stable live state
-                    print(f"Current Stop Loss Status: {sl_trade.orderStatus.status}")
-                    break
-
-            # Now continue to wait until it's actually filled or cancelled
-            while not sl_trade.isDone():
-                await ib.updateEvent
-        else:
-            print(f"Primary order failed or was cancelled. Status: {trade.orderStatus.status}")
-            for entry in trade.log:
-                if entry.message: print(f"Reason: {entry.message}")
+        print("\nBoth Stop Losses are ACTIVE. Listening for events... (Ctrl+C to stop)")
+        while any(not t.isDone() for t in active_stop_losses):
+            await asyncio.sleep(1)
+            ib.waitOnUpdate()
 
     except Exception as e:
         print(f"An error occurred: {e}")

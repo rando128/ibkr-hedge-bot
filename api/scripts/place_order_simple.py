@@ -28,7 +28,7 @@ async def main():
 
     try:
         print(f"Connecting to IBKR (Account: {account_id})...")
-        await ib.connectAsync('127.0.0.1', 7497, clientId=10)
+        await ib.connectAsync('127.0.0.1', 7497, clientId=12)
 
         contract = Stock(symbol=symbol, exchange='SMART', primaryExchange='SBF', currency='EUR')
         await ib.qualifyContractsAsync(contract)
