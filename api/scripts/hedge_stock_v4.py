@@ -79,6 +79,17 @@ def onCommissionReport(trade, fill, report):
     if len(pnl_stats['fills']) >= 3:
         report_pnl()
 
+def onTrailingStopStatus(trade):
+    """
+    Called when the Trailing Stop order status or price changes.
+    """
+    status = trade.orderStatus
+    # For Trailing stops, the trigger price is stored in auxPrice.
+    # stopPrice is only for Stop/StopLimit orders.
+    curr_stop = getattr(trade.order, 'auxPrice', 0)
+
+    print(f"[TRAILING UPDATE] Account: {trade.order.account} | Status: {status.status} | Current Stop: {curr_stop}")
+
 def onStopLossFill(trade, fill):
     """
     Triggered when one of the Stop Losses is filled.
@@ -86,23 +97,25 @@ def onStopLossFill(trade, fill):
     print(f"\n>>>> STOP LOSS TRIGGERED on {trade.order.account} <<<<")
 
     # identify the surviving leg
-    hit_leg = 'long' if trade == active_trades['long'] else 'short'
+    hit_leg = 'long' if trade.order.account == config['long_account'] else 'short'
     surviving_leg = 'short' if hit_leg == 'long' else 'long'
     surviving_trade = active_trades[surviving_leg]
 
     if surviving_trade and not surviving_trade.isDone():
         status = surviving_trade.orderStatus.status
+        # Use account info to determine correct label for logging
+        acc = surviving_trade.order.account
+        label = "LONG" if acc == config['long_account'] else "SHORT"
+
         if status not in ('PendingCancel', 'Cancelled', 'ApiCancelled'):
-            print(f"Cancelling surviving Stop Loss ({status}) on {surviving_trade.order.account}...")
+            print(f"Cancelling surviving Stop Loss ({status}) on {acc} ({label})...")
             config['ib'].cancelOrder(surviving_trade.order)
 
         # Place Trailing Stop on the surviving leg
-        # Action must be the same as the original SL (SELL for long, BUY for short)
         action = surviving_trade.order.action
         qty = surviving_trade.order.totalQuantity
-        acc = surviving_trade.order.account
 
-        print(f"Switching {surviving_leg.upper()} leg to {config['trailing_pct']}% Trailing Stop on account {acc}...")
+        print(f"Switching {label} leg to {config['trailing_pct']}% Trailing Stop on account {acc}...")
         trail_order = Order(
             action=action,
             totalQuantity=qty,
@@ -112,7 +125,9 @@ def onStopLossFill(trade, fill):
             tif='GTC',
             outsideRth=True
         )
-        config['ib'].placeOrder(trade.contract, trail_order)
+        trail_trade = config['ib'].placeOrder(trade.contract, trail_order)
+        # Attach the status listener to see price updates
+        trail_trade.statusEvent += onTrailingStopStatus
         print("Trailing Stop submitted. Protection transitioned.")
 
 def onFill(trade, fill):
@@ -130,7 +145,11 @@ def onFill(trade, fill):
     account = trade.order.account
 
     print(f"\n--- EVENT: ORDER FILLED ---")
-    print(f"Account: {account} | Action: {action} | Qty: {exec.shares} @ {exec.price}")
+    # Determine leg type for better logging
+    leg_type = "LONG" if account == config['long_account'] else "SHORT"
+    role = "ENTRY" if ((action == 'BUY' and leg_type == 'LONG') or (action == 'SELL' and leg_type == 'SHORT')) else "EXIT"
+
+    print(f"[{leg_type} {role}] Account: {account} | {trade.contract.symbol} {action} {exec.shares} @ {exec.price}")
 
     # Cash-flow logic:
     # BUY is always money leaving the account (cost)
@@ -163,6 +182,7 @@ async def main():
     parser.add_argument('--trailingPct', type=float, default=2.0, help='Trailing stop percentage (e.g., 2.0 for 2%%)')
     parser.add_argument('--longAccount', type=str, required=True, help='Account for LONG leg')
     parser.add_argument('--shortAccount', type=str, required=True, help='Account for SHORT leg')
+    parser.add_argument('--useAlgo', action='store_true', help='Use IBKR Adaptive Algo (primarily US Stocks)')
     parser.add_argument('--port', type=int, default=7497, help='TWS/Gateway port')
 
     args = parser.parse_args()
@@ -170,9 +190,9 @@ async def main():
     config['long_account'] = args.longAccount
     config['short_account'] = args.shortAccount
 
-    # Update start time immediately before connecting
+    # Update start time slightly in the past to ensure we don't miss the first immediate fill
     global script_start_time
-    script_start_time = datetime.now(timezone.utc)
+    script_start_time = datetime.now(timezone.utc).replace(second=0, microsecond=0)
 
     ib = IB()
     config['ib'] = ib # Store for callbacks
@@ -226,7 +246,10 @@ async def main():
                 print("Error: --qty is required for Stocks.")
                 return
             long_order = MarketOrder(action='BUY', totalQuantity=args.qty, account=args.longAccount, tif='GTC')
-            if contract.currency == 'USD':
+
+            # Use Adaptive Algo only if explicitly requested
+            if args.useAlgo and contract.currency == 'USD':
+                print(f"Applying Adaptive Algo (Normal priority)...")
                 long_order.algoStrategy = 'Adaptive'
                 long_order.algoParams = [TagValue('priority', 'Normal')]
 
@@ -239,6 +262,8 @@ async def main():
 
         if long_trade.orderStatus.status == 'Filled':
             avg_price = long_trade.orderStatus.avgFillPrice
+            print(f"--- [LONG ENTRY] FILLED at {avg_price} ---")
+
             # Compliance for high-priced Euronext
             leg_tick = 0.05 if (avg_price >= 200 and contract.currency == 'EUR') else min_tick
 
@@ -262,7 +287,10 @@ async def main():
             short_order = MarketOrder(action='SELL', totalQuantity=args.qty or 0, account=args.shortAccount, tif='IOC')
         else:
             short_order = MarketOrder(action='SELL', totalQuantity=args.qty, account=args.shortAccount, tif='GTC')
-            if contract.currency == 'USD':
+
+            # Use Adaptive Algo only if explicitly requested
+            if args.useAlgo and contract.currency == 'USD':
+                print(f"Applying Adaptive Algo (Normal priority)...")
                 short_order.algoStrategy = 'Adaptive'
                 short_order.algoParams = [TagValue('priority', 'Normal')]
 
@@ -275,6 +303,8 @@ async def main():
 
         if short_trade.orderStatus.status == 'Filled':
             avg_price = short_trade.orderStatus.avgFillPrice
+            print(f"--- [SHORT ENTRY] FILLED at {avg_price} ---")
+
             leg_tick = 0.05 if (avg_price >= 200 and contract.currency == 'EUR') else min_tick
 
             # Stop Loss: SELL price -> BUY STOP above
