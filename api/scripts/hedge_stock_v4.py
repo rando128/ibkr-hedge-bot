@@ -7,9 +7,6 @@ from ib_insync import IB, Stock, Crypto, MarketOrder, StopOrder, Order, TagValue
 # MANDATORY: Patch asyncio for ib_insync
 util.patchAsyncio()
 
-# Tracks when the script started
-script_start_time = datetime.now(timezone.utc)
-
 # Global state to manage the legs, P&L, and order roles
 active_trades = {
     'long': None,
@@ -23,6 +20,7 @@ pnl_stats = {
     'total_sells': 0.0,     # Sum of all SELL amounts (cash in)
     'total_commission': 0.0,
     'fills': [],
+    'exec_ids': set(),      # Set of execId strings to track commissions robustly
     'symbol': '',
     'min_tick': 0.01        # Will be updated from contract details
 }
@@ -56,7 +54,9 @@ def report_pnl(is_final=False):
     print(f"========================================\n")
 
 def onCommissionReport(trade, fill, report):
-    if fill not in pnl_stats['fills']: return
+    # Only process commissions for executions we have tracked in this session
+    if report.execId not in pnl_stats['exec_ids']:
+        return
     pnl_stats['total_commission'] += report.commission
     print(f"[{datetime.now().strftime('%H:%M:%S')}] [COMMISSION]: {report.commission:.2f} {report.currency}")
 
@@ -99,7 +99,15 @@ async def onStopLossFill(trade, fill):
 
         # Place Trailing Stop
         action = 'SELL' if label == "LONG" else 'BUY'
-        qty = surviving_trade.order.totalQuantity
+
+        # 5. Determine Quantity from actual Position (Resilient to partials)
+        # Find the position for this specific account and symbol
+        positions = [p for p in config['ib'].positions() if p.contract.conId == trade.contract.conId and p.account == acc]
+        if not positions or positions[0].position == 0:
+            print(f"No active position found on {acc}. Not placing trailing stop.")
+            return
+
+        qty = abs(positions[0].position)
         market_price = fill.execution.price
 
         tick = pnl_stats['min_tick']
@@ -117,12 +125,16 @@ async def onStopLossFill(trade, fill):
         t_trade.statusEvent += onTrailingStopStatus
         active_trades[surviving_leg] = t_trade
 
-        # Register the role
-        order_role_map[trail_order.orderId] = f"{label}_TRAIL"
+        # Register the role using the trade object's orderId
+        order_role_map[t_trade.order.orderId] = f"{label}_TRAIL"
+        print("Trailing Stop submitted. Protection transitioned.")
 
 def onFill(trade, fill):
     exec = fill.execution
     pnl_stats['fills'].append(fill)
+    # Track the unique execution ID for robust commission matching
+    pnl_stats['exec_ids'].add(exec.execId)
+
     if trade.order.action == 'BUY': pnl_stats['total_buys'] += exec.shares * exec.price
     else: pnl_stats['total_sells'] += exec.shares * exec.price
 
@@ -191,9 +203,38 @@ async def main():
             await asyncio.sleep(0.5)
             ib.waitOnUpdate()
 
-        # 3. Place Stop Losses after both fills
-        print("\n>>> BOTH ENTRIES DONE. PLACING PROTECTION...")
-        l_qty, s_qty = l_trade.orderStatus.filled, s_trade.orderStatus.filled
+        # 3. VERIFY ENTRY COMPLETION (Panic Exit if one failed)
+        l_stat, s_stat = l_trade.orderStatus.status, s_trade.orderStatus.status
+        l_filled, s_filled = l_trade.orderStatus.filled, s_trade.orderStatus.filled
+
+        if l_stat != 'Filled' or s_stat != 'Filled' or l_filled == 0 or s_filled == 0:
+            print(f"\n!!! CRITICAL: ENTRY FAILURE !!!")
+            print(f"Long Status: {l_stat} (Filled: {l_filled})")
+            print(f"Short Status: {s_stat} (Filled: {s_filled})")
+            print("Aborting hedge and flattening positions...")
+
+            # Panic Close Long
+            if l_filled > 0:
+                print(f"Flattening partial LONG position ({l_filled} shares)...")
+                ib.placeOrder(contract, MarketOrder('SELL', l_filled, account=args.longAccount))
+            # Panic Close Short
+            if s_filled > 0:
+                print(f"Flattening partial SHORT position ({s_filled} shares)...")
+                ib.placeOrder(contract, MarketOrder('BUY', s_filled, account=args.shortAccount))
+
+            # Orphan Cleanup
+            for t in ib.openTrades():
+                if t.contract.conId == contract.conId and t.order.account in [args.longAccount, args.shortAccount]:
+                    ib.cancelOrder(t.order)
+
+            return # Exit script
+
+        if l_filled != s_filled:
+            print(f"\nWARNING: Quantity mismatch! Long: {l_filled}, Short: {s_filled}. Proceeding with asymmetric protection.")
+
+        # 4. Place Stop Losses after successful entry
+        print("\n>>> BOTH ENTRIES FILLED. PLACING PROTECTION...")
+        l_qty, s_qty = l_filled, s_filled
         l_price, s_price = l_trade.orderStatus.avgFillPrice, s_trade.orderStatus.avgFillPrice
 
         # Long SL (Sell Stop)
