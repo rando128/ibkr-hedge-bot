@@ -69,26 +69,28 @@ def onCommissionReport(trade, fill, report):
     """
     Callback when IBKR reports the actual commission for a fill.
     """
-    # Ignore historical commissions from previous sessions
-    if fill.execution.time < script_start_time:
+    # Only process commissions for fills we have tracked in this session
+    if fill not in pnl_stats['fills']:
         return
 
     pnl_stats['total_commission'] += report.commission
     print(f"[COMMISSION]: {report.commission:.2f} {report.currency} for {trade.contract.symbol}")
-    # Update report after commission arrives
-    if len(pnl_stats['fills']) >= 3:
-        report_pnl()
+    report_pnl()
 
 def onTrailingStopStatus(trade):
     """
     Called when the Trailing Stop order status or price changes.
     """
     status = trade.orderStatus
-    # For Trailing stops, the trigger price is stored in auxPrice.
-    # stopPrice is only for Stop/StopLimit orders.
-    curr_stop = getattr(trade.order, 'auxPrice', 0)
+    # IBKR stores the dynamic trigger price in different fields depending on state.
+    # 1. status.stopPrice is the official live trigger price
+    # 2. trade.order.auxPrice is the initial submission price
+    curr_stop = status.stopPrice if status.stopPrice > 0 else getattr(trade.order, 'auxPrice', 0)
 
-    print(f"[TRAILING UPDATE] Account: {trade.order.account} | Status: {status.status} | Current Stop: {curr_stop}")
+    # Handle IBKR's Double.MAX_VALUE placeholder
+    price_str = f"{curr_stop:.2f}" if 0 < curr_stop < 1e10 else "Calculating..."
+
+    print(f"[TRAILING UPDATE] Account: {trade.order.account} | Status: {status.status} | Current Stop: {price_str}")
 
 def onStopLossFill(trade, fill):
     """
@@ -111,11 +113,27 @@ def onStopLossFill(trade, fill):
             print(f"Cancelling surviving Stop Loss ({status}) on {acc} ({label})...")
             config['ib'].cancelOrder(surviving_trade.order)
 
-        # Place Trailing Stop on the surviving leg
-        action = surviving_trade.order.action
+        # Switch to Trailing Stop (2%)
+        acc = surviving_trade.order.account
+        action = surviving_trade.order.action # Keep same exit direction
         qty = surviving_trade.order.totalQuantity
 
-        print(f"Switching {label} leg to {config['trailing_pct']}% Trailing Stop on account {acc}...")
+        # Calculate initial estimated trail price for logging
+        # We try to get the current price from the IB cache
+        ticker = config['ib'].ticker(trade.contract)
+        market_price = ticker.marketPrice() if ticker.marketPrice() > 0 else ticker.close
+
+        # Determine tick for rounding
+        leg_tick = 0.05 if (market_price >= 200 and trade.contract.currency == 'EUR') else 0.01
+
+        trail_price = 0.0
+        if action == 'SELL': # Closing a LONG
+            trail_price = math.floor(market_price * (1 - (config['trailing_pct'] / 100)) / leg_tick) * leg_tick
+        else: # BUY to cover a SHORT
+            trail_price = math.ceil(market_price * (1 + (config['trailing_pct'] / 100)) / leg_tick) * leg_tick
+
+        print(f"Switching {label} leg to {config['trailing_pct']}% Trailing Stop on account {acc} (Estimated initial stop: {trail_price:.2f})...")
+
         trail_order = Order(
             action=action,
             totalQuantity=qty,
@@ -128,6 +146,8 @@ def onStopLossFill(trade, fill):
         trail_trade = config['ib'].placeOrder(trade.contract, trail_order)
         # Attach the status listener to see price updates
         trail_trade.statusEvent += onTrailingStopStatus
+        # Attach to global tracker so we can wait for it
+        active_trades[surviving_leg] = trail_trade
         print("Trailing Stop submitted. Protection transitioned.")
 
 def onFill(trade, fill):
@@ -135,11 +155,6 @@ def onFill(trade, fill):
     Callback for all order fills. Tracks P&L across both legs.
     """
     exec = fill.execution
-
-    # Ignore historical fills from previous sessions
-    if exec.time < script_start_time:
-        return
-
     amount = exec.shares * exec.price
     action = trade.order.action
     account = trade.order.account
@@ -329,10 +344,13 @@ async def main():
                 ib.waitOnUpdate()
 
         print("\nBoth Stop Losses are ACTIVE. Listening for events... (Ctrl+C to stop)")
-        # Continue listening as long as any trade is still alive
-        while True:
+        # Continue listening until both legs in active_trades are Done
+        while any(t and not t.isDone() for t in active_trades.values()):
             await asyncio.sleep(1)
             ib.waitOnUpdate()
+
+        print("\n>>> ALL LEGS CLOSED. HEDGE COMPLETE.")
+        report_pnl()
 
     except Exception as e:
         print(f"An error occurred: {e}")
