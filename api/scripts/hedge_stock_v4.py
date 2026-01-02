@@ -61,6 +61,19 @@ def q_floor(price, tick):
 def q_ceil(price, tick):
     return math.ceil((price - 1e-12) / tick) * tick
 
+def fmt_ts(exec_time):
+    """Format timestamp for logging, preserving string if provided."""
+    if hasattr(exec_time, 'strftime'):
+        return exec_time.strftime('%H:%M:%S')
+    if isinstance(exec_time, str):
+        # Often "YYYYMMDD HH:MM:SS", we want HH:MM:SS
+        return exec_time[-8:] if len(exec_time) >= 8 else exec_time
+    return datetime.now().strftime('%H:%M:%S')
+
+def get_safe_timestamp(exec_time):
+    """Pass-through the timestamp object/string for fmt_ts to handle."""
+    return exec_time if exec_time else datetime.now()
+
 def onError(trade, reqId, errorCode, errorString, advancedOrderRejectJson=""):
     if reqId == -1: return
     msg = errorString if errorString else errorCode
@@ -77,9 +90,10 @@ def report_pnl(is_final=False):
 
     # Print per-leg summaries
     for role, details in pnl_stats['leg_details'].items():
-        avg_p = details['price'] / details['qty']
-        time_str = details['time'].strftime('%H:%M:%S')
-        print(f"{role:12} | {details['qty']:5} @ {avg_p:8.4f} | {time_str}")
+        qty = details['qty']
+        avg_p = (details['price'] / qty) if qty else 0.0
+        time_str = fmt_ts(details['time'])
+        print(f"{role:12} | {qty:5} @ {avg_p:8.4f} | {time_str}")
 
     print(f"----------------------------------------")
     print(f"Total Cash Out (Buys):  {pnl_stats['total_buys']:.2f}")
@@ -97,9 +111,9 @@ def onCommissionReport(trade, fill, report):
     if exec_id not in pnl_stats['exec_ids']:
         return
     pnl_stats['total_commission'] += report.commission
-    # Use execution time from the exchange
-    exec_time = fill.execution.time
-    print(f"[{exec_time.strftime('%H:%M:%S')}] [COMMISSION]: {report.commission:.2f} {report.currency}")
+    # Use execution time from the exchange (with safety check)
+    exec_time = get_safe_timestamp(fill.execution.time)
+    print(f"[{fmt_ts(exec_time)}] [COMMISSION]: {report.commission:.2f} {report.currency}")
 
 def onTrailingStopStatus(trade):
     status = trade.orderStatus
@@ -121,9 +135,9 @@ async def onStopLossFill(trade, fill):
     transitioned = False
 
     try:
-        # Use execution time from the exchange
-        exec_time = fill.execution.time
-        print(f"\n>>>> [{exec_time.strftime('%H:%M:%S')}] STOP LOSS TRIGGERED on {trade.order.account} <<<<")
+        # Use execution time from the exchange (with safety check)
+        exec_time = get_safe_timestamp(fill.execution.time)
+        print(f"\n>>>> [{fmt_ts(exec_time)}] STOP LOSS TRIGGERED on {trade.order.account} <<<<")
 
         hit_leg = 'long' if trade.order.account == config['long_account'] else 'short'
         surviving_leg = 'short' if hit_leg == 'long' else 'long'
@@ -190,7 +204,8 @@ async def onStopLossFill(trade, fill):
         print(f"Switching {label} leg to {config['trailing_pct']}% Trailing Stop (Est: {trail_price:.4f})...")
         trail_order = Order(
             action=action, totalQuantity=qty, orderType='TRAIL',
-            trailingPercent=config['trailing_pct'], account=acc, tif='GTC', outsideRth=True
+            trailingPercent=config['trailing_pct'], account=acc, tif='GTC', outsideRth=True,
+            orderRef=f"C{config['cycle_count']}_{label}_TRAIL"
         )
         t_trade = config['ib'].placeOrder(trade.contract, trail_order)
         t_trade.statusEvent += onTrailingStopStatus
@@ -221,9 +236,9 @@ def onFill(trade, fill):
 
     account = trade.order.account
     role = order_role_map.get(trade.order.orderId, "UNKNOWN")
-    # Use exchange timestamp from the execution
-    exec_time = exec.time
-    print(f"--- [{exec_time.strftime('%H:%M:%S')}] {role} FILLED on {account}: {exec.shares} @ {exec.price:.4f} ---")
+    # Use exchange timestamp from the execution (with safety check)
+    exec_time = get_safe_timestamp(exec.time)
+    print(f"--- [{fmt_ts(exec_time)}] {role} FILLED on {account}: {exec.shares} @ {exec.price:.4f} ---")
 
     # Record detailed leg data
     if role not in pnl_stats['leg_details']:
