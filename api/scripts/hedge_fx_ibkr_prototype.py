@@ -790,6 +790,7 @@ class HedgeFXStrategy:
 # ============================================================
 def main():
     mgr = IBClientManager(HOST, PORT, CLIENT_ID)
+    last_heartbeat = time.time()
 
     # initial connect
     mgr.ensure_connected()
@@ -803,8 +804,10 @@ def main():
     print("[MAIN] running... (Ctrl+C to stop)")
     try:
         while True:
+            print(f"[MAIN] tick={time.time()}")
             # keep connection alive / attempt reconnect
             ok = mgr.ensure_connected()
+            print(f"[MAIN] connected={mgr.ib.isConnected()} degraded={mgr.degraded}")
             if ok and not strat.md.ticker:
                 # after reconnect, resubscribe
                 try:
@@ -814,7 +817,17 @@ def main():
                     print(f"[MAIN] resubscribe failed: {e}")
 
             # process incoming updates (drives ticker bid/ask)
-            mgr.ib.waitOnUpdate(timeout=1.0)
+            got_update = mgr.ib.waitOnUpdate(timeout=1.0)
+            print(f"[MAIN] got_update={got_update}")
+            # 👇 ADD THIS HEARTBEAT
+            if time.time() - last_heartbeat >= 5:
+                print(
+                    f"[HEARTBEAT] connected={mgr.ib.isConnected()} "
+                    f"degraded={mgr.degraded} "
+                    f"got_update={got_update} "
+                    f"mid={strat.md.last_mid}"
+                )
+                last_heartbeat = time.time()
 
             # poll market data; if a bar completed, run strategy
             bar = strat.md.poll()

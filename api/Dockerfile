@@ -9,3 +9,4 @@ COPY --chown=user . .
 RUN modelw-docker build
 
 CMD ["modelw-docker", "serve"]
+

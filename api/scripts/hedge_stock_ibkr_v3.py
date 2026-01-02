@@ -1,39 +1,23 @@
 """
-hedge_stock_ibrk.py — IBKR Hedging Bot (Stocks, ib_insync) — Final v2
-===============================================================
+hedge_stock_ibrk_v3.py — IBKR Hedging Bot (Stocks, ib_insync) — v3 (debuggable, fixed asyncio)
+=============================================================================================
 
-Design goals (spec-conformant):
-- IBKR stocks are NETTED per symbol -> do NOT assume two simultaneous positions.
-- Strategy is ORDER/EXECUTION-ledger driven:
-  1) Executions (fills) are truth
-  2) Open orders validate protection
-  3) positions() is safety sanity check only
-- Two-phase entry (best-possible atomicity on IBKR):
-  - Submit Leg A bracket, wait SL child is LIVE (PreSubmitted/Submitted)
-  - If parent fills before SL live -> ABORT+FLATTEN
-  - Submit Leg B bracket, wait SL live
-- Strict SL "live" definition: {"PreSubmitted","Submitted"} only
-- Hedge break occurs on ANY stop fill (partial included) on either initial SL
-- On hedge break:
-  - Determine loser/survivor via execution ledger (not positions())
-  - Cancel remaining initial SL and await terminal
-  - Submit trailing stop for survivor sized from ledger remaining qty
-  - If ambiguity persists -> flatten (global invariant)
-- Non-blocking waits: use ib.sleep(), no time.sleep() in event loop
-- Trailing stop created via generic Order(orderType="TRAIL", trailingPercent=...)
-
-Dependencies:
-  pip install ib_insync pyyaml
+Key fixes vs your v3:
+- ✅ NEVER use `await self.ib.sleep()` (many ib_insync versions implement IB.sleep via util.run -> run_until_complete -> crashes in running loop)
+  -> use `await asyncio.sleep()` everywhere inside async coroutines.
+- ✅ No `asyncio.create_task()` from synchronous IB callbacks unless loop is running.
+  -> schedule safely via `_schedule()` which uses the running loop if available, else defers.
+- ✅ Background tasks (heartbeat/watchdog/fallback) launched only once the async main is running.
+- ✅ Kickstart tick scheduled from async main.
 
 Run:
-  python hedge_stock_ibrk.py --config config.yaml
-Optional overrides:
-  python hedge_stock_ibrk.py --config config.yaml --symbol NVDA --port 7497 --client-id 7
+  python hedge_stock_ibrk_v3.py --config config.yaml --log-level DEBUG
 """
 
 from __future__ import annotations
 
 import argparse
+import asyncio
 import dataclasses
 import logging
 import sys
@@ -44,15 +28,8 @@ from enum import Enum
 from typing import Any, Dict, Optional, Tuple
 
 import yaml
-from ib_insync import (
-    IB,
-    Order,
-    Stock,
-    Trade,
-    MarketOrder,
-    StopOrder,
-    util,
-)
+from ib_insync import IB, Order, Stock, Trade, MarketOrder, StopOrder, util
+
 
 # -----------------------------
 # Status semantics (spec)
@@ -61,11 +38,10 @@ LIVE_STATUSES = {"PreSubmitted", "Submitted"}
 TERMINAL_STATUSES = {"Filled", "Cancelled", "ApiCancelled", "Inactive", "Rejected"}
 BAD_STATUSES = {"Rejected"}  # terminal-bad
 
+
 # -----------------------------
 # Config
 # -----------------------------
-
-
 @dataclass
 class Config:
     # Instrument
@@ -75,15 +51,15 @@ class Config:
 
     # Strategy
     notional_per_leg_usd: float = 100.0
-    sl_pct: float = 0.03          # 3%
-    trailing_pct: float = 0.15    # 15% (we convert to trailingPercent=15.0)
+    sl_pct: float = 0.03
+    trailing_pct: float = 0.15  # 0.15 => 15% trailingPercent
     bar_size: str = "1 min"
-    cooldown_bars: int = 1        # 1 bar = 1 min
+    cooldown_bars: int = 1
 
-    # IBKR connection defaults (configurable)
+    # IBKR
     host: str = "127.0.0.1"
-    port: int = 7497              # TWS paper default; gateway paper often 4002
-    client_id: int = 1            # REQUIRED; any int but unique per running client
+    port: int = 7497
+    client_id: int = 1
 
     # Safety / timings
     entering_timeout_sec: float = 30.0
@@ -93,11 +69,17 @@ class Config:
     reconcile_retries: int = 3
     reconcile_retry_delay_sec: float = 0.25
 
-    # Optional correctness
-    price_rounding: str = "cent"  # "cent" or "minTick" (minTick not always accessible reliably)
+    # Diagnostics / scheduling
+    heartbeat_sec: float = 5.0
+    bar_stale_warn_sec: float = 90.0          # warn if no bar update callbacks for this long
+    clock_fallback_sec: float = 60.0          # run tick every N seconds even if bars not arriving
+    kickstart: bool = True
+
+    # Rounding
+    price_rounding: str = "cent"
 
     # Logging
-    log_level: str = "INFO"       # DEBUG / INFO / WARNING / ERROR
+    log_level: str = "INFO"
 
 
 def _deep_merge(base: Dict[str, Any], overlay: Dict[str, Any]) -> Dict[str, Any]:
@@ -124,9 +106,9 @@ def _validate_config(cfg: Config) -> None:
     if cfg.notional_per_leg_usd <= 0:
         raise ValueError("notional_per_leg_usd must be > 0")
     if not (0 < cfg.sl_pct < 1):
-        raise ValueError("sl_pct must be in (0,1) e.g. 0.03")
+        raise ValueError("sl_pct must be in (0,1)")
     if not (0 < cfg.trailing_pct < 1):
-        raise ValueError("trailing_pct must be in (0,1) e.g. 0.15")
+        raise ValueError("trailing_pct must be in (0,1)")
     if cfg.cooldown_bars < 0:
         raise ValueError("cooldown_bars must be >= 0")
     if cfg.client_id is None:
@@ -140,11 +122,14 @@ def config_from_sources(defaults: Config, yaml_dict: Optional[Dict[str, Any]], c
         normalized = dict(yaml_dict)
         if "ibkr" in normalized and isinstance(normalized["ibkr"], dict):
             ibkr = normalized.pop("ibkr")
-            normalized = _deep_merge(normalized, {
-                "host": ibkr.get("host", d["host"]),
-                "port": ibkr.get("port", d["port"]),
-                "client_id": ibkr.get("client_id", d["client_id"]),
-            })
+            normalized = _deep_merge(
+                normalized,
+                {
+                    "host": ibkr.get("host", d["host"]),
+                    "port": ibkr.get("port", d["port"]),
+                    "client_id": ibkr.get("client_id", d["client_id"]),
+                },
+            )
         d = _deep_merge(d, normalized)
 
     # CLI overrides
@@ -176,15 +161,13 @@ def config_from_sources(defaults: Config, yaml_dict: Optional[Dict[str, Any]], c
 # -----------------------------
 # State machine
 # -----------------------------
-
-
 class State(str, Enum):
     IDLE = "IDLE"
     ENTERING = "ENTERING"
     HEDGED = "HEDGED"
     SINGLE_LEG = "SINGLE_LEG"
     COOLDOWN = "COOLDOWN"
-    DEGRADED = "DEGRADED"  # disconnected / unsafe
+    DEGRADED = "DEGRADED"
 
 
 @dataclass
@@ -195,7 +178,6 @@ class Leg:
 
 @dataclass
 class ExecLedger:
-    # Cumulative fills per leg
     parent_filled: Dict[str, float] = field(default_factory=lambda: {"LONG": 0.0, "SHORT": 0.0})
     sl_filled: Dict[str, float] = field(default_factory=lambda: {"LONG": 0.0, "SHORT": 0.0})
 
@@ -209,9 +191,7 @@ class ExecLedger:
         return (self.sl_filled["LONG"] > 0) or (self.sl_filled["SHORT"] > 0)
 
     def loser_leg(self) -> Optional[str]:
-        # Loser is the leg whose SL has any fill
         if self.sl_filled["LONG"] > 0 and self.sl_filled["SHORT"] > 0:
-            # extremely violent move; ambiguous - handled by flatten
             return "BOTH"
         if self.sl_filled["LONG"] > 0:
             return "LONG"
@@ -228,8 +208,6 @@ class ExecLedger:
         return None
 
     def remaining_qty(self, leg: str) -> float:
-        # Remaining exposure on a leg = parent fills - SL fills on same leg
-        # (SL fills represent exits for that leg)
         return max(0.0, self.parent_filled[leg] - self.sl_filled[leg])
 
 
@@ -245,9 +223,7 @@ class CycleContext:
 # -----------------------------
 # Bot
 # -----------------------------
-
-
-class HedgeBotV2:
+class HedgeBotV3:
     def __init__(self, cfg: Config) -> None:
         self.cfg = cfg
         self.ib = IB()
@@ -257,28 +233,55 @@ class HedgeBotV2:
         self.ledger = ExecLedger()
 
         self.contract = Stock(cfg.symbol, cfg.exchange, cfg.currency)
+
         self.last_bar_time: Optional[datetime] = None
+        self._last_bars_update_ts: float = 0.0
+        self._bars_updates_seen: int = 0
+
         self.degraded_reason: Optional[str] = None
+        self._orderid_to_role: Dict[int, Tuple[str, str]] = {}
 
-        self._orderid_to_role: Dict[int, Tuple[str, str]] = {}  # orderId -> (leg, role) where role ∈ {"PARENT","SL","TRAIL"}
+        # Loop/task scheduling safety
+        self._loop: Optional[asyncio.AbstractEventLoop] = None
+        self._deferred_coros: list = []  # coroutines to schedule once loop exists
 
-        self.logger = logging.getLogger("hedge-bot-v2")
-        self.logger.setLevel(getattr(logging, cfg.log_level.upper(), logging.INFO))
+        # logger
+        self.logger = logging.getLogger(f"hedge-bot-v3:{cfg.symbol}")
+        lvl = getattr(logging, cfg.log_level.upper(), logging.INFO)
+        self.logger.setLevel(lvl)
         handler = logging.StreamHandler(sys.stdout)
+        handler.setLevel(lvl)
         handler.setFormatter(logging.Formatter("%(asctime)s | %(levelname)s | %(message)s"))
-        if not self.logger.handlers:
-            self.logger.addHandler(handler)
+        self.logger.handlers.clear()
+        self.logger.addHandler(handler)
 
-    # -------- status helpers --------
+    # ---------- scheduling helpers ----------
+    def _schedule(self, coro, name: str = "") -> None:
+        """
+        Schedule a coroutine safely:
+        - If an asyncio loop is running, schedule immediately.
+        - If not yet running, defer until `_main()` starts.
+        """
+        try:
+            loop = asyncio.get_running_loop()
+            loop.create_task(coro, name=name or None)
+            return
+        except RuntimeError:
+            # no running loop yet
+            self._deferred_coros.append((coro, name))
 
+    async def _asleep(self, seconds: float) -> None:
+        # IMPORTANT: Do NOT use `await self.ib.sleep()` inside async coroutines (many ib_insync versions break)
+        await asyncio.sleep(seconds)
+
+    # ---------- status helpers ----------
     def _status(self, tr: Optional[Trade]) -> Optional[str]:
         if not tr or not tr.orderStatus:
             return None
         return tr.orderStatus.status
 
     def _is_live(self, tr: Optional[Trade]) -> bool:
-        st = self._status(tr)
-        return st in LIVE_STATUSES
+        return self._status(tr) in LIVE_STATUSES
 
     def _is_terminal(self, tr: Optional[Trade]) -> bool:
         st = self._status(tr)
@@ -287,8 +290,7 @@ class HedgeBotV2:
     def _is_rejected(self, tr: Optional[Trade]) -> bool:
         return self._status(tr) in BAD_STATUSES
 
-    # -------- broker connect / events --------
-
+    # ---------- connect / events ----------
     def connect(self) -> None:
         self.logger.info(f"Connecting: host={self.cfg.host} port={self.cfg.port} clientId={self.cfg.client_id}")
         self.ib.connect(self.cfg.host, self.cfg.port, clientId=int(self.cfg.client_id))
@@ -301,7 +303,6 @@ class HedgeBotV2:
         self.ib.qualifyContracts(self.contract)
         self.logger.info(f"Qualified: {self.contract}")
 
-        # Bars used only for cooldown cadence, NOT for stop inference
         bars = self.ib.reqHistoricalData(
             self.contract,
             endDateTime="",
@@ -315,12 +316,7 @@ class HedgeBotV2:
         bars.updateEvent += self._on_bars_update
         self.logger.info(f"Subscribed to bars: {self.cfg.bar_size} (keepUpToDate=True)")
 
-        # Initial sanity
         self._reconcile_sync(reason="startup")
-
-        # # ✅ Kick off first tick immediately (otherwise we wait for first bar update forever)
-        # self.ib.createTask(self._tick_on_bar())
-        self.logger.info("Kick: scheduled initial _tick_on_bar()")
 
     def _on_disconnected(self) -> None:
         self.logger.warning("Disconnected. Entering DEGRADED.")
@@ -331,9 +327,10 @@ class HedgeBotV2:
         self.logger.info("Reconnected. Reconciling.")
         self.degraded_reason = None
         self._reconcile_sync(reason="reconnect")
+        # Do NOT schedule asyncio tasks here unless loop running; defer safely:
+        self._schedule(self._tick_on_bar(), name="tick_on_reconnect")
 
     def _on_order_status(self, trade: Trade) -> None:
-        # lightweight timeout checks can be placed here if desired
         self.logger.debug(
             f"ORDER_STATUS: id={trade.order.orderId} type={trade.order.orderType} "
             f"status={trade.orderStatus.status} filled={trade.orderStatus.filled} remaining={trade.orderStatus.remaining}"
@@ -347,36 +344,29 @@ class HedgeBotV2:
         leg, role = self._orderid_to_role.get(order_id, ("UNKNOWN", "UNKNOWN"))
         self.logger.info(f"EXEC: orderId={order_id} role={role} leg={leg} qty={qty} price={price}")
 
-        # Update ledger
         if leg in ("LONG", "SHORT") and role == "PARENT":
             self.ledger.record_parent_fill(leg, qty)
         elif leg in ("LONG", "SHORT") and role == "SL":
             self.ledger.record_sl_fill(leg, qty)
-        elif role == "TRAIL":
-            # trailing fill ends cycle; handled by reconcile
-            pass
 
-        # Event-driven transitions
         if self.state == State.ENTERING:
-            # If any parent fills before its SL is live -> this is unsafe; flatten.
-            # We'll check both legs.
-            self.ib.createTask(self._check_entering_safety())
+            self._schedule(self._check_entering_safety(), name="entering_safety")
         elif self.state == State.HEDGED:
-            # Any SL fill (partial) => hedge break
             if self.ledger.any_sl_fill():
-                self.ib.createTask(self._handle_hedge_break())
+                self._schedule(self._handle_hedge_break(), name="hedge_break")
         elif self.state == State.SINGLE_LEG:
-            # trailing may fill -> reconcile will end cycle
-            self.ib.createTask(self._reconcile_async(reason="execDetails_single"))
+            self._schedule(self._reconcile_async(reason="execDetails_single"), name="reconcile_single")
 
     def _on_bars_update(self, bars, has_new_bar: bool) -> None:
-        # ✅ add this
+        self._last_bars_update_ts = time.time()
+        self._bars_updates_seen += 1
+
+        # Always log at DEBUG so you can see if this callback fires at all
         try:
             last_date = bars[-1].date if bars else None
         except Exception:
             last_date = None
-        self.logger.debug(
-            f"BARS_UPDATE: has_new_bar={has_new_bar} len={len(bars) if bars else 0} last_date={last_date}")
+        self.logger.debug(f"BARS_UPDATE: has_new_bar={has_new_bar} len={len(bars) if bars else 0} last_date={last_date}")
 
         if not has_new_bar or not bars:
             return
@@ -385,24 +375,84 @@ class HedgeBotV2:
         bar_time = util.parseIBDatetime(bar.date) if isinstance(bar.date, str) else bar.date
         self.last_bar_time = bar_time
         self.logger.info(f"NEW_BAR: time={bar_time} close={bar.close}")
-        self.ib.createTask(self._tick_on_bar())
+        self._schedule(self._tick_on_bar(), name="tick_on_bar")
 
-    # -------- periodic/cooldown tick --------
+    # ---------- async main & background tasks ----------
+    async def _main(self) -> None:
+        self._loop = asyncio.get_running_loop()
+        self.logger.info("Async main started (event loop running)")
 
+        # Schedule any deferred tasks created before loop existed
+        if self._deferred_coros:
+            self.logger.debug(f"Scheduling deferred coroutines: n={len(self._deferred_coros)}")
+            for coro, name in self._deferred_coros:
+                asyncio.create_task(coro, name=name or None)
+            self._deferred_coros.clear()
+
+        # Start background diagnostics
+        asyncio.create_task(self._heartbeat(), name="heartbeat")
+        asyncio.create_task(self._bar_staleness_watchdog(), name="bar_watchdog")
+        asyncio.create_task(self._clock_fallback(), name="clock_fallback")
+
+        if self.cfg.kickstart:
+            asyncio.create_task(self._tick_on_bar(), name="kickstart_tick")
+            self.logger.info("Kickstart: scheduled initial _tick_on_bar()")
+
+        # Keep alive forever
+        while True:
+            await self._asleep(3600)
+
+    async def _heartbeat(self) -> None:
+        while True:
+            try:
+                net = self._net_position_symbol()
+                ot = len(self.ib.openTrades())
+                self.logger.debug(
+                    f"HEARTBEAT state={self.state} connected={self.ib.isConnected()} "
+                    f"barsUpdatesSeen={self._bars_updates_seen} lastBarTime={self.last_bar_time} "
+                    f"openTrades={ot} netPos={net}"
+                )
+            except Exception as e:
+                self.logger.debug(f"HEARTBEAT error: {e}")
+            await self._asleep(self.cfg.heartbeat_sec)
+
+    async def _bar_staleness_watchdog(self) -> None:
+        while True:
+            await self._asleep(self.cfg.heartbeat_sec)
+            if self._last_bars_update_ts == 0:
+                self.logger.warning("No BARS_UPDATE callbacks observed yet.")
+                continue
+            age = time.time() - self._last_bars_update_ts
+            if age >= self.cfg.bar_stale_warn_sec:
+                self.logger.warning(
+                    f"Bar stream stale: no BARS_UPDATE for {age:.1f}s. "
+                    "Either no market data permission or keepUpToDate stream not delivering."
+                )
+
+    async def _clock_fallback(self) -> None:
+        while True:
+            await self._asleep(self.cfg.clock_fallback_sec)
+            if self.state != State.DEGRADED:
+                self.logger.debug("CLOCK_FALLBACK tick")
+                await self._tick_on_bar()
+
+    # ---------- tick ----------
     async def _tick_on_bar(self) -> None:
         self.logger.debug(f"TICK_ON_BAR: state={self.state} last_bar_time={self.last_bar_time}")
 
         if self.state == State.DEGRADED:
+            self.logger.debug("TICK gate: DEGRADED -> skip")
             return
 
         # Cooldown expiry
-        if self.state == State.COOLDOWN and self.ctx.cycle_ended_at_bar_time and self.last_bar_time:
-            if self._bars_elapsed(self.ctx.cycle_ended_at_bar_time, self.last_bar_time) >= self.cfg.cooldown_bars:
+        if self.state == State.COOLDOWN and self.ctx.cycle_ended_at_bar_time:
+            now = self.last_bar_time or datetime.now()
+            if self._bars_elapsed(self.ctx.cycle_ended_at_bar_time, now) >= self.cfg.cooldown_bars:
                 self.logger.info("Cooldown elapsed -> IDLE")
                 self._reset_cycle()
                 self.state = State.IDLE
 
-        # Entering timeout (wall-clock)
+        # ENTERING timeout
         if self.state == State.ENTERING and self.ctx.entering_started_at:
             if datetime.now() - self.ctx.entering_started_at > timedelta(seconds=self.cfg.entering_timeout_sec):
                 await self._flatten_if_ambiguous("ENTERING timeout")
@@ -411,24 +461,21 @@ class HedgeBotV2:
         if self.state == State.IDLE:
             await self._start_cycle()
 
-    # -------- core flow --------
-
+    # ---------- core flow ----------
     async def _start_cycle(self) -> None:
-        self.logger.info("Starting cycle.")
-        # Preconditions: no open orders for this symbol and position sanity (net should be ~0)
         if self._has_open_orders_symbol():
             self.logger.debug("IDLE gate: has open orders -> skip")
             return
 
-        # Net position sanity check only (not strategy truth)
-        if abs(self._net_position_symbol()) > 1e-9:
-            self.logger.warning("Net position not flat while IDLE; flattening.")
+        net = self._net_position_symbol()
+        if abs(net) > 1e-9:
+            self.logger.warning(f"IDLE gate: net position not flat (net={net}) -> flatten")
             await self._flatten_if_ambiguous("Net position non-zero in IDLE")
             return
 
         last = await self._get_last_price()
         if not last:
-            self.logger.warning("No last price; skipping entry.")
+            self.logger.warning("IDLE gate: no last/marketPrice from reqMktData -> skip (market data permission?)")
             return
 
         qty = max(self.cfg.notional_per_leg_usd / last, 0.0001)
@@ -437,7 +484,6 @@ class HedgeBotV2:
         self.state = State.ENTERING
         self.ctx.entering_started_at = datetime.now()
 
-        # Two-phase submission (best-possible atomicity)
         await self._enter_two_phase(last_price=last, qty=qty)
 
     async def _enter_two_phase(self, last_price: float, qty: float) -> None:
@@ -450,17 +496,14 @@ class HedgeBotV2:
             qty=qty,
             stop_price=last_price * (1 - self.cfg.sl_pct),
         )
-        self.ctx.long.parent = long_parent
-        self.ctx.long.sl = long_sl
+        self.ctx.long.parent, self.ctx.long.sl = long_parent, long_sl
 
         await self._await_trade_live(long_sl, timeout=self.cfg.sl_live_timeout_sec, what="LONG SL live")
 
-        # If long parent filled but long SL not live -> abort
         if self.ledger.parent_filled["LONG"] > 0 and not self._is_live(long_sl):
             await self._flatten_if_ambiguous("LONG parent filled before LONG SL live")
             return
 
-        # If SL rejected/missing -> abort (await already checks rejection, but keep hard guard)
         if self._is_rejected(long_sl) or not self._is_live(long_sl):
             await self._flatten_if_ambiguous("LONG SL not live or rejected")
             return
@@ -474,46 +517,37 @@ class HedgeBotV2:
             qty=qty,
             stop_price=last_price * (1 + self.cfg.sl_pct),
         )
-        self.ctx.short.parent = short_parent
-        self.ctx.short.sl = short_sl
+        self.ctx.short.parent, self.ctx.short.sl = short_parent, short_sl
 
         await self._await_trade_live(short_sl, timeout=self.cfg.sl_live_timeout_sec, what="SHORT SL live")
 
-        # Partial fill symmetry rule during ENTERING:
-        # If either parent has filled but both have not filled within a small window -> flatten.
         await self._check_entering_safety()
 
-        # If short SL rejected/missing -> abort
         if self._is_rejected(short_sl) or not self._is_live(short_sl):
             await self._flatten_if_ambiguous("SHORT SL not live or rejected")
             return
 
-        # If we reach here: both SLs are live; hedge considered active
         self.logger.info("ENTERING -> HEDGED (both initial SLs live)")
         self.state = State.HEDGED
 
     async def _check_entering_safety(self) -> None:
-        # Enforce "never partial hedge"
         long_f = self.ledger.parent_filled["LONG"]
         short_f = self.ledger.parent_filled["SHORT"]
 
-        # If one side has any fill and the other has zero after a short grace -> abort
         if (long_f > 0 and short_f == 0) or (short_f > 0 and long_f == 0):
-            # allow a tiny grace window for the other parent to fill
-            await self.ib.sleep(0.25)
+            self.logger.warning(f"ENTERING safety: partial hedge detected (L={long_f}, S={short_f}); grace 0.25s")
+            await self._asleep(0.25)
             long_f = self.ledger.parent_filled["LONG"]
             short_f = self.ledger.parent_filled["SHORT"]
             if (long_f > 0 and short_f == 0) or (short_f > 0 and long_f == 0):
                 await self._flatten_if_ambiguous("Partial hedge during ENTERING (one parent filled, other not)")
 
-        # If any initial SL is rejected while parent has fills -> abort
         if self.ledger.parent_filled["LONG"] > 0 and (not self._is_live(self.ctx.long.sl) or self._is_rejected(self.ctx.long.sl)):
             await self._flatten_if_ambiguous("LONG parent filled but LONG SL not live/rejected")
         if self.ledger.parent_filled["SHORT"] > 0 and (not self._is_live(self.ctx.short.sl) or self._is_rejected(self.ctx.short.sl)):
             await self._flatten_if_ambiguous("SHORT parent filled but SHORT SL not live/rejected")
 
     async def _handle_hedge_break(self) -> None:
-        # If both SLs have fills -> ambiguous extreme -> flatten (spec safety)
         loser = self.ledger.loser_leg()
         if loser == "BOTH":
             await self._flatten_if_ambiguous("Both initial SLs filled (extreme move)")
@@ -527,26 +561,21 @@ class HedgeBotV2:
         self.logger.info(f"HEDGE BREAK: loser={loser} survivor={survivor}")
         self.state = State.SINGLE_LEG
 
-        # Cancel remaining initial SL (the survivor's initial SL is still active, must be replaced)
         remaining_sl = self.ctx.long.sl if survivor == "LONG" else self.ctx.short.sl
         if remaining_sl and not self._is_terminal(remaining_sl):
+            self.logger.info(f"Cancel remaining initial SL for survivor={survivor} orderId={remaining_sl.order.orderId}")
             self.ib.cancelOrder(remaining_sl.order)
             await self._await_trade_terminal(remaining_sl, timeout=self.cfg.cancel_timeout_sec, what="cancel remaining initial SL")
 
-        # After cancel, compute remaining qty from ledger
         qty = self.ledger.remaining_qty(survivor)
         if qty <= 0:
             await self._flatten_if_ambiguous("No remaining qty for survivor after hedge break")
             return
 
-        # Submit trailing (retry once if needed)
         await self._submit_trailing_with_retry(survivor_leg=survivor, qty=qty)
-
-        # Reconcile after protection install
         await self._reconcile_async(reason="post_hedge_break")
 
-    # -------- orders --------
-
+    # ---------- orders ----------
     def _submit_bracket(
         self,
         leg: str,
@@ -555,10 +584,6 @@ class HedgeBotV2:
         qty: float,
         stop_price: float,
     ) -> Tuple[Trade, Trade]:
-        """
-        One-leg bracket: parent MarketOrder (transmit=False) + child StopOrder (transmit=True).
-        This provides atomicity WITHIN the leg, and we do two-phase to minimize cross-leg risk.
-        """
         parent = MarketOrder(parent_action, qty, transmit=False)
         parent.orderId = self.ib.client.getReqId()
 
@@ -567,123 +592,133 @@ class HedgeBotV2:
         child.parentId = parent.orderId
         child.orderId = self.ib.client.getReqId()
 
-        self.logger.info(f"Submit {leg} bracket: parent {parent_action} MKT qty={qty:.6f} "
-                         f"child {stop_action} STP @ {spx:.4f} parentId={parent.orderId}")
+        self.logger.info(
+            f"Submit {leg} bracket: parent {parent_action} MKT qty={qty:.6f} orderId={parent.orderId} "
+            f"child {stop_action} STP@{spx:.2f} orderId={child.orderId} parentId={child.parentId}"
+        )
 
         parent_trade = self.ib.placeOrder(self.contract, parent)
         child_trade = self.ib.placeOrder(self.contract, child)
 
         self._orderid_to_role[parent.orderId] = (leg, "PARENT")
         self._orderid_to_role[child.orderId] = (leg, "SL")
-
         return parent_trade, child_trade
 
     async def _submit_trailing_with_retry(self, survivor_leg: str, qty: float) -> None:
         action = "SELL" if survivor_leg == "LONG" else "BUY"
         trailing_percent = max(0.01, self.cfg.trailing_pct * 100.0)
 
-        order = Order(
-            action=action,
-            orderType="TRAIL",
-            totalQuantity=qty,
-            trailingPercent=trailing_percent,
-        )
+        order = Order(action=action, orderType="TRAIL", totalQuantity=qty, trailingPercent=trailing_percent)
 
         self.logger.info(f"Submit trailing: action={action} qty={qty:.6f} trailingPercent={trailing_percent:.2f}%")
         tr = self.ib.placeOrder(self.contract, order)
         self.ctx.trailing = tr
         self._orderid_to_role[tr.order.orderId] = ("NA", "TRAIL")
 
-        # Wait for live or terminal quickly; if rejected/inactive, retry once
         ok = await self._await_trade_live_or_terminal(tr, timeout=self.cfg.trailing_live_timeout_sec, what="trailing live")
+        self.logger.debug(f"Trailing await result: ok={ok} status={self._status(tr)} orderId={tr.order.orderId}")
+
         if ok and self._is_live(tr):
             return
 
-        # Retry once if not live
-        self.logger.warning("Trailing not live; retrying once.")
+        self.logger.warning("Trailing not confirmed live; retrying once.")
         tr2 = self.ib.placeOrder(self.contract, order)
         self.ctx.trailing = tr2
         self._orderid_to_role[tr2.order.orderId] = ("NA", "TRAIL")
 
         ok2 = await self._await_trade_live_or_terminal(tr2, timeout=self.cfg.trailing_live_timeout_sec, what="trailing live retry")
+        self.logger.debug(f"Trailing retry await result: ok={ok2} status={self._status(tr2)} orderId={tr2.order.orderId}")
+
         if ok2 and self._is_live(tr2):
             return
 
         await self._flatten_if_ambiguous("Trailing could not be confirmed live")
 
-    # -------- awaits (non-blocking) --------
-
+    # ---------- awaits ----------
     async def _await_trade_live(self, tr: Trade, timeout: float, what: str) -> None:
         t0 = time.time()
+        last_st = None
         while time.time() - t0 < timeout:
+            st = self._status(tr)
+            if st != last_st:
+                self.logger.debug(f"AWAIT({what}): status={st} orderId={tr.order.orderId}")
+                last_st = st
             if self._is_rejected(tr):
                 await self._flatten_if_ambiguous(f"{what}: rejected")
                 return
             if self._is_live(tr):
+                self.logger.debug(f"AWAIT({what}): LIVE achieved status={st}")
                 return
-            await self.ib.sleep(0.05)
-        await self._flatten_if_ambiguous(f"{what}: timeout (not live)")
+            await self._asleep(0.05)
+        await self._flatten_if_ambiguous(f"{what}: timeout (not live), last_status={self._status(tr)}")
 
     async def _await_trade_terminal(self, tr: Trade, timeout: float, what: str) -> None:
         t0 = time.time()
+        last_st = None
         while time.time() - t0 < timeout:
+            st = self._status(tr)
+            if st != last_st:
+                self.logger.debug(f"AWAIT({what}): status={st} orderId={tr.order.orderId}")
+                last_st = st
             if self._is_terminal(tr):
+                self.logger.debug(f"AWAIT({what}): TERMINAL status={st}")
                 return
-            await self.ib.sleep(0.05)
-        await self._flatten_if_ambiguous(f"{what}: cancel timeout (not terminal)")
+            await self._asleep(0.05)
+        await self._flatten_if_ambiguous(f"{what}: timeout (not terminal), last_status={self._status(tr)}")
 
     async def _await_trade_live_or_terminal(self, tr: Trade, timeout: float, what: str) -> bool:
         t0 = time.time()
+        last_st = None
         while time.time() - t0 < timeout:
-            if self._is_live(tr):
+            st = self._status(tr)
+            if st != last_st:
+                self.logger.debug(f"AWAIT({what}): status={st} orderId={tr.order.orderId}")
+                last_st = st
+            if self._is_live(tr) or self._is_terminal(tr):
                 return True
-            if self._is_terminal(tr):
-                return True
-            await self.ib.sleep(0.05)
-        self.logger.warning(f"{what}: timeout waiting for live/terminal")
+            await self._asleep(0.05)
+        self.logger.warning(f"{what}: timeout waiting for live/terminal; last_status={self._status(tr)}")
         return False
 
-    # -------- reconcile & flatten invariant --------
-
+    # ---------- reconcile / flatten ----------
     def _reconcile_sync(self, reason: str) -> None:
-        # Minimal sync reconcile: used at startup/reconnect
         self.logger.info(f"Reconcile(sync): {reason}")
-        # If we reconnect mid-exposure and can't safely adopt, flatten.
         if self.state == State.DEGRADED:
             if self._has_open_orders_symbol() or abs(self._net_position_symbol()) > 1e-9:
                 self.logger.warning("DEGRADED with exposure/orders: flattening.")
-                self.ib.createTask(self._flatten_if_ambiguous("DEGRADED sync reconcile"))
+                self._schedule(self._flatten_if_ambiguous("DEGRADED sync reconcile"), name="flatten_degraded")
             else:
                 self.state = State.IDLE
 
     async def _reconcile_async(self, reason: str) -> None:
-        # Non-blocking reconcile loop; if ambiguous beyond retries -> flatten
-        for _ in range(self.cfg.reconcile_retries):
+        self.logger.debug(f"RECONCILE(async): {reason}")
+        for i in range(self.cfg.reconcile_retries):
             if self.state == State.DEGRADED:
                 return
-            # If trailing exists and is filled -> end cycle
             if self.ctx.trailing and self._status(self.ctx.trailing) == "Filled":
                 await self._end_cycle("Trailing filled")
                 return
-            await self.ib.sleep(self.cfg.reconcile_retry_delay_sec)
+            self.logger.debug(
+                f"RECONCILE(async): pass {i+1}/{self.cfg.reconcile_retries} "
+                f"trailingStatus={self._status(self.ctx.trailing)}"
+            )
+            await self._asleep(self.cfg.reconcile_retry_delay_sec)
 
     async def _flatten_if_ambiguous(self, reason: str) -> None:
-        """
-        Global invariant: if safety cannot be proven, cancel everything and market-flatten.
-        """
         self.logger.error(f"FLATTEN_IF_AMBIGUOUS: {reason}")
 
-        # Cancel all open orders for this symbol
         for tr in self.ib.openTrades():
             if tr.contract.symbol == self.cfg.symbol:
                 try:
+                    self.logger.warning(
+                        f"CANCEL: orderId={tr.order.orderId} type={tr.order.orderType} status={tr.orderStatus.status}"
+                    )
                     self.ib.cancelOrder(tr.order)
                 except Exception as e:
                     self.logger.warning(f"Cancel error: {e}")
 
-        await self.ib.sleep(0.2)
+        await self._asleep(0.2)
 
-        # Flatten net position if any (sanity layer)
         net = self._net_position_symbol()
         if abs(net) > 1e-9:
             action = "SELL" if net > 0 else "BUY"
@@ -697,8 +732,7 @@ class HedgeBotV2:
     async def _end_cycle(self, reason: str) -> None:
         self.logger.info(f"Cycle ended: {reason}")
         self.ctx.cycle_ended_at_bar_time = self.last_bar_time or datetime.now()
-        # Keep ledger for debugging; reset on cooldown expiry
-        # Also cancel any remaining tracked orders (best-effort)
+
         for tr in self.ib.openTrades():
             if tr.contract.symbol == self.cfg.symbol:
                 try:
@@ -711,19 +745,30 @@ class HedgeBotV2:
         self.ledger = ExecLedger()
         self._orderid_to_role = {}
 
-    # -------- market data / account queries --------
-
+    # ---------- market/account ----------
     async def _get_last_price(self) -> Optional[float]:
+        self.logger.debug("REQ_MKTDATA: requesting last/marketPrice")
         ticker = self.ib.reqMktData(self.contract, "", False, False)
-        await self.ib.sleep(0.4)
+        await self._asleep(0.6)
+
         last = None
         if ticker.last:
             last = float(ticker.last)
+            self.logger.debug(f"REQ_MKTDATA: got last={last}")
         else:
             mp = ticker.marketPrice()
             if mp:
                 last = float(mp)
-        self.ib.cancelMktData(ticker.contract)
+                self.logger.debug(f"REQ_MKTDATA: got marketPrice={last}")
+            else:
+                self.logger.debug(
+                    f"REQ_MKTDATA: no last/marketPrice; bid={ticker.bid} ask={ticker.ask} close={ticker.close}"
+                )
+
+        try:
+            self.ib.cancelMktData(ticker.contract)
+        except Exception:
+            pass
         return last
 
     def _has_open_orders_symbol(self) -> bool:
@@ -736,7 +781,6 @@ class HedgeBotV2:
         return False
 
     def _net_position_symbol(self) -> float:
-        # Sanity check only (stocks net)
         net = 0.0
         for p in self.ib.positions():
             if getattr(p.contract, "symbol", None) == self.cfg.symbol:
@@ -744,25 +788,22 @@ class HedgeBotV2:
         return net
 
     def _round_price(self, px: float) -> float:
-        # Practical safe default: cents
-        if self.cfg.price_rounding == "cent":
-            return round(px, 2)
+        # Stocks: safe default cents
         return round(px, 2)
 
     @staticmethod
     def _bars_elapsed(start: datetime, now: datetime) -> int:
         return int((now - start).total_seconds() // 60)
 
-    # -------- run --------
-
+    # ---------- run ----------
     def run(self) -> None:
         self.logger.info("Running. Ctrl+C to stop.")
         try:
-            self.ib.run()
+            # ib_insync can drive the asyncio loop by running an awaitable here
+            self.ib.run(self._main())
         except KeyboardInterrupt:
             self.logger.info("Stopping. Cancelling and disconnecting.")
             try:
-                # best-effort cancel symbol orders
                 for tr in self.ib.openTrades():
                     if tr.contract.symbol == self.cfg.symbol:
                         self.ib.cancelOrder(tr.order)
@@ -773,8 +814,6 @@ class HedgeBotV2:
 # -----------------------------
 # CLI
 # -----------------------------
-
-
 def parse_args() -> argparse.Namespace:
     p = argparse.ArgumentParser()
     p.add_argument("--config", type=str, default="config.yaml")
@@ -803,7 +842,7 @@ def main() -> None:
 
     cfg = config_from_sources(defaults, yaml_dict, args)
 
-    bot = HedgeBotV2(cfg)
+    bot = HedgeBotV3(cfg)
     bot.connect()
     bot.run()
 
