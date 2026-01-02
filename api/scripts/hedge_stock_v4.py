@@ -83,9 +83,10 @@ def onTrailingStopStatus(trade):
     """
     status = trade.orderStatus
     # IBKR stores the dynamic trigger price in different fields depending on state.
-    # 1. status.stopPrice is the official live trigger price
-    # 2. trade.order.auxPrice is the initial submission price
-    curr_stop = status.stopPrice if status.stopPrice > 0 else getattr(trade.order, 'auxPrice', 0)
+    # We check multiple locations safely.
+    curr_stop = getattr(status, 'stopPrice', 0)
+    if curr_stop <= 0:
+        curr_stop = getattr(trade.order, 'auxPrice', 0)
 
     # Handle IBKR's Double.MAX_VALUE placeholder
     price_str = f"{curr_stop:.2f}" if 0 < curr_stop < 1e10 else "Calculating..."
@@ -114,14 +115,12 @@ def onStopLossFill(trade, fill):
             config['ib'].cancelOrder(surviving_trade.order)
 
         # Switch to Trailing Stop (2%)
-        acc = surviving_trade.order.account
         action = surviving_trade.order.action # Keep same exit direction
         qty = surviving_trade.order.totalQuantity
 
         # Calculate initial estimated trail price for logging
-        # We try to get the current price from the IB cache
-        ticker = config['ib'].ticker(trade.contract)
-        market_price = ticker.marketPrice() if ticker.marketPrice() > 0 else ticker.close
+        # We use the price of the Stop Loss fill as our current market price proxy
+        market_price = fill.execution.price
 
         # Determine tick for rounding
         leg_tick = 0.05 if (market_price >= 200 and trade.contract.currency == 'EUR') else 0.01
