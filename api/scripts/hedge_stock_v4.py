@@ -1,7 +1,7 @@
 import asyncio
 import argparse
 import math
-from ib_insync import IB, Stock, Crypto, MarketOrder, StopOrder, TagValue, util
+from ib_insync import IB, Stock, Crypto, MarketOrder, StopOrder, Order, TagValue, util
 
 # MANDATORY: Patch asyncio for ib_insync
 util.patchAsyncio()
@@ -16,6 +16,47 @@ def onError(trade, reqId, errorCode, errorString, advancedOrderRejectJson=""):
     msg = errorString if errorString else errorCode
     code = errorCode if errorString else "INFO"
     print(f"\n[IBKR {code}]: {msg} (reqId={reqId})")
+
+# Global state to manage the two legs
+active_trades = {
+    'long': None,  # Will store the sl_long_trade
+    'short': None  # Will store the sl_short_trade
+}
+
+def onStopLossFill(trade, fill):
+    """
+    Triggered when one of the Stop Losses is filled.
+    """
+    print(f"\n>>>> STOP LOSS TRIGGERED on {trade.order.account} <<<<")
+
+    # Identify which leg was hit and which one survived
+    hit_leg = 'long' if trade == active_trades['long'] else 'short'
+    surviving_leg = 'short' if hit_leg == 'long' else 'long'
+
+    surviving_trade = active_trades[surviving_leg]
+
+    if surviving_trade and not surviving_trade.isDone():
+        print(f"Cancelling surviving Stop Loss on {surviving_trade.order.account}...")
+        trade.ib.cancelOrder(surviving_trade.order)
+
+        # Place Trailing Stop on the surviving leg
+        # Action must be the same as the original SL (SELL for long, BUY for short)
+        action = surviving_trade.order.action
+        qty = surviving_trade.order.totalQuantity
+        acc = surviving_trade.order.account
+
+        print(f"Switching {surviving_leg.upper()} leg to 2% Trailing Stop on account {acc}...")
+        trail_order = Order(
+            action=action,
+            totalQuantity=qty,
+            orderType='TRAIL',
+            trailingPercent=2.0,
+            account=acc,
+            tif='GTC',
+            outsideRth=True
+        )
+        trade.ib.placeOrder(trade.contract, trail_order)
+        print("Trailing Stop submitted. Protection transitioned.")
 
 def onFill(trade, fill):
     """
@@ -115,7 +156,8 @@ async def main():
             sl_long = StopOrder(action='SELL', totalQuantity=long_trade.orderStatus.filled, stopPrice=sl_price, account=args.longAccount, tif='GTC', outsideRth=True)
             sl_long_trade = ib.placeOrder(contract, sl_long)
             sl_long_trade.fillEvent += onFill
-            active_stop_losses.append(sl_long_trade)
+            sl_long_trade.fillEvent += onStopLossFill # Logic Switcher
+            active_trades['long'] = sl_long_trade
 
         # ---------------------------------------------------------
         # LEG 2: SHORT (SELL) on shortAccount
@@ -149,19 +191,22 @@ async def main():
             sl_short = StopOrder(action='BUY', totalQuantity=short_trade.orderStatus.filled, stopPrice=sl_price, account=args.shortAccount, tif='GTC', outsideRth=True)
             sl_short_trade = ib.placeOrder(contract, sl_short)
             sl_short_trade.fillEvent += onFill
-            active_stop_losses.append(sl_short_trade)
+            sl_short_trade.fillEvent += onStopLossFill # Logic Switcher
+            active_trades['short'] = sl_short_trade
 
         # ---------------------------------------------------------
         # 6. Final confirmation & Monitoring
         # ---------------------------------------------------------
         print("\nAll legs submitted. Waiting for Stop Losses to reach live state...")
-        for sl_t in active_stop_losses:
+        for sl_t in [active_trades['long'], active_trades['short']]:
+            if not sl_t: continue
             while sl_t.orderStatus.status == 'PendingSubmit':
                 await asyncio.sleep(0.1)
                 ib.waitOnUpdate()
 
         print("\nBoth Stop Losses are ACTIVE. Listening for events... (Ctrl+C to stop)")
-        while any(not t.isDone() for t in active_stop_losses):
+        # Continue listening as long as any trade is still alive
+        while True:
             await asyncio.sleep(1)
             ib.waitOnUpdate()
 
