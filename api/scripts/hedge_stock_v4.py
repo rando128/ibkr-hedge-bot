@@ -264,6 +264,17 @@ async def main():
     parser.add_argument('--port', type=int, default=7497)
     args = parser.parse_args()
 
+    # Validate input arguments
+    if args.qty <= 0:
+        print(f"Error: qty must be greater than 0 (provided: {args.qty})")
+        return
+    if args.stopPct <= 0:
+        print(f"Error: stopPct must be greater than 0 (provided: {args.stopPct})")
+        return
+    if args.trailingPct <= 0:
+        print(f"Error: trailingPct must be greater than 0 (provided: {args.trailingPct})")
+        return
+
     config.update({'trailing_pct': args.trailingPct, 'long_account': args.longAccount, 'short_account': args.shortAccount})
     config['transitioning'] = False
     config['transition_done'] = False
