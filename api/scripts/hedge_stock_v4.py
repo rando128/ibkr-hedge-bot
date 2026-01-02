@@ -17,11 +17,47 @@ def onError(trade, reqId, errorCode, errorString, advancedOrderRejectJson=""):
     code = errorCode if errorString else "INFO"
     print(f"\n[IBKR {code}]: {msg} (reqId={reqId})")
 
-# Global state to manage the two legs
+# Global state to manage the two legs and P&L
 active_trades = {
-    'long': None,  # Will store the sl_long_trade
-    'short': None  # Will store the sl_short_trade
+    'long': None,
+    'short': None
 }
+
+pnl_stats = {
+    'entry_cost': 0.0,      # Money spent on entries (Long Buy + Short Sell proceeds)
+    'exit_proceeds': 0.0,   # Money received from exits
+    'total_commission': 0.0,# Sum of all commissions
+    'fills': [],
+    'symbol': ''
+}
+
+def report_pnl():
+    """
+    Calculates and prints the combined P&L across all accounts.
+    """
+    gross_pnl = pnl_stats['exit_proceeds'] - pnl_stats['entry_cost']
+    net_pnl = gross_pnl - pnl_stats['total_commission']
+
+    print(f"\n========================================")
+    print(f"FULL CYCLE P&L REPORT ({pnl_stats['symbol']})")
+    print(f"----------------------------------------")
+    print(f"Total Entry Basis: {pnl_stats['entry_cost']:.2f}")
+    print(f"Total Exit Value:  {pnl_stats['exit_proceeds']:.2f}")
+    print(f"Total Commissions: {pnl_stats['total_commission']:.2f}")
+    print(f"----------------------------------------")
+    print(f"GROSS REALIZED:    {gross_pnl:.2f}")
+    print(f"NET REALIZED P&L:  {net_pnl:.2f}")
+    print(f"========================================\n")
+
+def onCommissionReport(trade, fill, report):
+    """
+    Callback when IBKR reports the actual commission for a fill.
+    """
+    pnl_stats['total_commission'] += report.commission
+    print(f"[COMMISSION]: {report.commission:.2f} {report.currency} for {trade.contract.symbol}")
+    # Update report after commission arrives
+    if len(pnl_stats['fills']) >= 3:
+        report_pnl()
 
 def onStopLossFill(trade, fill):
     """
@@ -60,15 +96,34 @@ def onStopLossFill(trade, fill):
 
 def onFill(trade, fill):
     """
-    Callback for all order fills.
+    Callback for all order fills. Tracks P&L.
     """
+    exec = fill.execution
+    amount = exec.shares * exec.price
+    action = trade.order.action
+
     print(f"\n--- EVENT: ORDER FILLED ---")
-    print(f"Account: {trade.order.account}")
-    print(f"Action: {trade.order.action}")
-    print(f"Symbol: {trade.contract.symbol}")
-    print(f"Qty: {fill.execution.shares} @ {fill.execution.price}")
+    print(f"Account: {trade.order.account} | Action: {action} | Qty: {exec.shares} @ {exec.price}")
+
+    # P&L LOGIC
+    # Entry: Buying for Long, Selling for Short
+    # Exit: Selling for Long, Buying for Short
+
+    # We use a simple accounting approach:
+    # BUY is always a negative cash flow (paying money)
+    # SELL is always a positive cash flow (receiving money)
+    if action == 'BUY':
+        pnl_stats['entry_cost'] += amount
+    else: # SELL
+        pnl_stats['exit_proceeds'] += amount
+
+    pnl_stats['fills'].append(fill)
+
     if trade.isDone():
         print(f"Status: {trade.orderStatus.status}")
+        # Only report P&L if we have an exit
+        if len(pnl_stats['fills']) >= 3:
+            report_pnl()
     print(f"---------------------------\n")
 
 async def main():
@@ -84,8 +139,9 @@ async def main():
     args = parser.parse_args()
 
     ib = IB()
-    # Attach global error handler
+    # Attach global handlers
     ib.errorEvent += onError
+    ib.commissionReportEvent += onCommissionReport
     try:
         print(f"Connecting to IBKR on port {args.port}...")
         ib.connect('127.0.0.1', args.port, clientId=10)
@@ -107,6 +163,7 @@ async def main():
 
         ib.qualifyContracts(contract)
         print(f"Contract qualified: {contract}")
+        pnl_stats['symbol'] = contract.symbol
 
         # 2. Determine Contract Details (Tick Size)
         print("Fetching contract details for tick size...")
