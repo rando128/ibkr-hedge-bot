@@ -97,7 +97,9 @@ def onCommissionReport(trade, fill, report):
     if exec_id not in pnl_stats['exec_ids']:
         return
     pnl_stats['total_commission'] += report.commission
-    print(f"[{datetime.now().strftime('%H:%M:%S')}] [COMMISSION]: {report.commission:.2f} {report.currency}")
+    # Use execution time from the exchange
+    exec_time = fill.execution.time
+    print(f"[{exec_time.strftime('%H:%M:%S')}] [COMMISSION]: {report.commission:.2f} {report.currency}")
 
 def onTrailingStopStatus(trade):
     status = trade.orderStatus
@@ -105,6 +107,7 @@ def onTrailingStopStatus(trade):
     if curr_stop <= 0: curr_stop = getattr(trade.order, 'auxPrice', 0)
 
     if status.status == 'Filled':
+        # Use average fill price and optionally time if available (though status doesn't have time)
         print(f"[TRAILING UPDATE] Account: {trade.order.account} | Status: {status.status} | EXECUTED at {status.avgFillPrice:.4f}")
     else:
         price_str = f"{curr_stop:.4f}" if 0 < curr_stop < 1e10 else "Calculating..."
@@ -118,8 +121,9 @@ async def onStopLossFill(trade, fill):
     transitioned = False
 
     try:
-        now_str = datetime.now().strftime("%H:%M:%S")
-        print(f"\n>>>> [{now_str}] STOP LOSS TRIGGERED on {trade.order.account} <<<<")
+        # Use execution time from the exchange
+        exec_time = fill.execution.time
+        print(f"\n>>>> [{exec_time.strftime('%H:%M:%S')}] STOP LOSS TRIGGERED on {trade.order.account} <<<<")
 
         hit_leg = 'long' if trade.order.account == config['long_account'] else 'short'
         surviving_leg = 'short' if hit_leg == 'long' else 'long'
@@ -127,11 +131,11 @@ async def onStopLossFill(trade, fill):
         acc = config['long_account'] if surviving_leg == 'long' else config['short_account']
         label = surviving_leg.upper()
 
-        if surviving_trade and not surviving_trade.isDone():
+        if surviving_trade and surviving_trade.orderStatus.status in ('PreSubmitted', 'Submitted'):
             print(f"Cancelling surviving Stop Loss on {acc} ({label})...")
             config['ib'].cancelOrder(surviving_trade.order)
 
-            # 4. Wait until cancelled
+            # 4. Wait until terminal state
             deadline = asyncio.get_event_loop().time() + 10
             while not surviving_trade.isDone() and asyncio.get_event_loop().time() < deadline:
                 await asyncio.sleep(0.1)
@@ -159,8 +163,10 @@ async def onStopLossFill(trade, fill):
         else:
             if not surviving_trade:
                 print(f"No surviving SL trade object found for {acc} ({label}). Checking position.")
-            else:
+            elif surviving_trade.isDone():
                 print(f"Surviving SL on {acc} ({label}) is already {surviving_trade.orderStatus.status}. Checking position.")
+            else:
+                print(f"Surviving SL on {acc} ({label}) status is {surviving_trade.orderStatus.status} (not active). Checking position.")
 
         # Place Trailing Stop based on actual Position
         action = 'SELL' if label == "LONG" else 'BUY'
@@ -215,19 +221,20 @@ def onFill(trade, fill):
 
     account = trade.order.account
     role = order_role_map.get(trade.order.orderId, "UNKNOWN")
-    now_ts = datetime.now()
-    print(f"--- [{now_ts.strftime('%H:%M:%S')}] {role} FILLED on {account}: {exec.shares} @ {exec.price:.4f} ---")
+    # Use exchange timestamp from the execution
+    exec_time = exec.time
+    print(f"--- [{exec_time.strftime('%H:%M:%S')}] {role} FILLED on {account}: {exec.shares} @ {exec.price:.4f} ---")
 
     # Record detailed leg data
     if role not in pnl_stats['leg_details']:
-        pnl_stats['leg_details'][role] = {'price': 0.0, 'qty': 0.0, 'time': now_ts}
+        pnl_stats['leg_details'][role] = {'price': 0.0, 'qty': 0.0, 'time': exec_time}
 
     pnl_stats['leg_details'][role]['price'] += exec.shares * exec.price
     pnl_stats['leg_details'][role]['qty'] += exec.shares
-    pnl_stats['leg_details'][role]['time'] = now_ts
+    pnl_stats['leg_details'][role]['time'] = exec_time
 
     # Trigger transition if it's a stop loss fill
-    if "SL" in role and not config.get('transitioning') and not config.get('transition_done'):
+    if role in ("LONG_SL", "SHORT_SL") and not config.get('transitioning') and not config.get('transition_done'):
         asyncio.create_task(onStopLossFill(trade, fill))
 
 async def main():
