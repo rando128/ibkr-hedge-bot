@@ -75,7 +75,10 @@ def onCommissionReport(trade, fill, report):
 
     pnl_stats['total_commission'] += report.commission
     print(f"[COMMISSION]: {report.commission:.2f} {report.currency} for {trade.contract.symbol}")
-    report_pnl()
+
+    # Only report P&L at the very end (4 fills)
+    if len(pnl_stats['fills']) == 4:
+        report_pnl()
 
 def onTrailingStopStatus(trade):
     """
@@ -88,16 +91,20 @@ def onTrailingStopStatus(trade):
     if curr_stop <= 0:
         curr_stop = getattr(trade.order, 'auxPrice', 0)
 
-    # Handle IBKR's Double.MAX_VALUE placeholder
-    price_str = f"{curr_stop:.2f}" if 0 < curr_stop < 1e10 else "Calculating..."
-
-    print(f"[TRAILING UPDATE] Account: {trade.order.account} | Status: {status.status} | Current Stop: {price_str}")
+    # If the order is filled, report the execution price
+    if status.status == 'Filled':
+        print(f"[TRAILING UPDATE] Account: {trade.order.account} | Status: {status.status} | EXECUTED at {status.avgFillPrice:.2f}")
+    else:
+        # Handle IBKR's Double.MAX_VALUE placeholder
+        price_str = f"{curr_stop:.2f}" if 0 < curr_stop < 1e10 else "Calculating..."
+        print(f"[TRAILING UPDATE] Account: {trade.order.account} | Status: {status.status} | Current Stop: {price_str}")
 
 def onStopLossFill(trade, fill):
     """
     Triggered when one of the Stop Losses is filled.
     """
-    print(f"\n>>>> STOP LOSS TRIGGERED on {trade.order.account} <<<<")
+    now_str = datetime.now().strftime("%H:%M:%S")
+    print(f"\n>>>> [{now_str}] STOP LOSS TRIGGERED on {trade.order.account} <<<<")
 
     # identify the surviving leg
     hit_leg = 'long' if trade.order.account == config['long_account'] else 'short'
@@ -157,8 +164,9 @@ def onFill(trade, fill):
     amount = exec.shares * exec.price
     action = trade.order.action
     account = trade.order.account
+    now_str = datetime.now().strftime("%H:%M:%S")
 
-    print(f"\n--- EVENT: ORDER FILLED ---")
+    print(f"\n--- [{now_str}] EVENT: ORDER FILLED ---")
     # Determine leg type for better logging
     leg_type = "LONG" if account == config['long_account'] else "SHORT"
     role = "ENTRY" if ((action == 'BUY' and leg_type == 'LONG') or (action == 'SELL' and leg_type == 'SHORT')) else "EXIT"
@@ -180,10 +188,10 @@ def onFill(trade, fill):
 
         # A full cycle requires exactly 4 fills
         num_fills = len(pnl_stats['fills'])
-        report_pnl()
 
         if num_fills == 4:
-            print(">>> ALL LEGS CLOSED. HEDGE COMPLETE.")
+            print(f">>> [{now_str}] ALL LEGS CLOSED. HEDGE COMPLETE.")
+            report_pnl()
 
     print(f"---------------------------\n")
 
@@ -348,6 +356,12 @@ async def main():
             await asyncio.sleep(1)
             ib.waitOnUpdate()
 
+        # Give a small grace period for the final commission report to arrive
+        print("\nAll trades completed. Waiting for final data sync...")
+        await asyncio.sleep(2)
+        ib.waitOnUpdate()
+
+        # FINAL Guaranteed Report
         print("\n>>> ALL LEGS CLOSED. HEDGE COMPLETE.")
         report_pnl()
 
