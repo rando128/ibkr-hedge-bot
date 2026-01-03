@@ -7,8 +7,8 @@ from .tasks import start_bot, stop_bot
 
 @admin.register(Bot)
 class BotAdmin(admin.ModelAdmin):
-    list_display = ['id', 'name', 'symbol', 'qty', 'status_badge', 'cycles_count', 'last_pnl', 'created_at', 'action_buttons', 'log_button']
-    list_filter = ['status', 'symbol', 'created_at']
+    list_display = ['id', 'name', 'symbol', 'qty', 'environment_badge', 'status_badge', 'cycles_count', 'last_pnl', 'created_at', 'action_buttons', 'log_button']
+    list_filter = ['status', 'environment', 'symbol', 'created_at']
     search_fields = ['name', 'symbol', 'long_account', 'short_account']
     readonly_fields = ['created_at', 'updated_at', 'started_at', 'stopped_at']
     actions = ['action_start_bots', 'action_stop_bots']
@@ -28,13 +28,31 @@ class BotAdmin(admin.ModelAdmin):
             'fields': ('long_account', 'short_account')
         }),
         ('Connection', {
-            'fields': ('port', 'use_algo')
+            'fields': ('environment', 'use_algo')
         }),
         ('Timestamps', {
             'fields': ('created_at', 'updated_at', 'started_at', 'stopped_at'),
             'classes': ('collapse',)
         }),
     )
+
+    def environment_badge(self, obj):
+        """Display environment as colored badge"""
+        colors = {
+            'PAPER': '#2196F3',  # Blue
+            'LIVE': '#FF5722',   # Red/Orange
+        }
+        labels = {
+            'PAPER': 'Paper',
+            'LIVE': 'Live',
+        }
+        color = colors.get(obj.environment, 'gray')
+        label = labels.get(obj.environment, obj.environment)
+        return format_html(
+            '<span style="background-color: {}; color: white; padding: 3px 10px; border-radius: 3px; font-weight: bold;">{}</span>',
+            color, label
+        )
+    environment_badge.short_description = 'Environment'
 
     def status_badge(self, obj):
         """Display status as colored badge"""

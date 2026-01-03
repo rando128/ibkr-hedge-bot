@@ -463,28 +463,31 @@ class BotRunner:
             min_tick = details[0].minTick if details else 0.01
 
             # Main cycle loop
-            @sync_to_async
-            def get_cycle_count():
-                return self.bot.cycles.count() + 1
-
-            cycle_number = await get_cycle_count()
-
             while not self.should_stop and await self.check_bot_status():
                 self.reset_cycle_state()
 
-                # Create new Cycle
+                # Get next cycle number and create cycle atomically
                 @sync_to_async
-                def create_cycle():
-                    return Cycle.objects.create(
-                        bot=self.bot,
-                        cycle_number=cycle_number,
-                        symbol=self.contract.symbol,
-                        contract_id=self.contract.conId,
-                    min_tick=Decimal(str(min_tick)),
-                    status='INITIALIZING'
-                )
+                def get_or_create_next_cycle():
+                    from django.db.models import Max
+                    # Get the highest cycle number for this bot
+                    max_cycle = self.bot.cycles.aggregate(Max('cycle_number'))['cycle_number__max']
+                    next_cycle_number = (max_cycle or 0) + 1
 
-                self.cycle = await create_cycle()
+                    # Use get_or_create to avoid duplicates
+                    cycle, created = Cycle.objects.get_or_create(
+                        bot=self.bot,
+                        cycle_number=next_cycle_number,
+                        defaults={
+                            'symbol': self.contract.symbol,
+                            'contract_id': self.contract.conId,
+                            'min_tick': Decimal(str(min_tick)),
+                            'status': 'INITIALIZING'
+                        }
+                    )
+                    return cycle, next_cycle_number
+
+                self.cycle, cycle_number = await get_or_create_next_cycle()
 
                 print(f"\n{'='*60}")
                 print(f"CYCLE {cycle_number} STARTED - {self.contract.symbol}")
@@ -498,8 +501,15 @@ class BotRunner:
                 success = await self._execute_cycle(min_tick, cycle_number)
 
                 if not success:
-                    cycle_number += 1
                     print("[CYCLE] Failed or not implemented - waiting 60s before retry")
+                    # Mark cycle as failed
+                    @sync_to_async
+                    def mark_failed():
+                        self.cycle.status = 'FAILED'
+                        self.cycle.completed_at = datetime.now(timezone.utc)
+                        self.cycle.save()
+                    await mark_failed()
+
                     # Sleep with status checking (check every second)
                     for _ in range(60):
                         if not await self.check_bot_status():
@@ -524,7 +534,6 @@ class BotRunner:
                     if not await self.check_bot_status():
                         break
                     await asyncio.sleep(1)
-                cycle_number += 1
 
         except Exception as e:
             print(f"\n[FATAL ERROR] {e}")

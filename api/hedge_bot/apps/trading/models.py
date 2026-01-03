@@ -13,6 +13,11 @@ class Bot(models.Model):
         ('ERROR', 'Error'),
     ]
 
+    ENVIRONMENT_CHOICES = [
+        ('PAPER', 'Paper Trading'),
+        ('LIVE', 'Live Trading'),
+    ]
+
     # Bot identification
     name = models.CharField(max_length=100, blank=True, help_text="Optional bot name")
 
@@ -44,8 +49,18 @@ class Bot(models.Model):
     short_account = models.CharField(max_length=50)
 
     # Connection settings
-    port = models.IntegerField(default=7497)
+    environment = models.CharField(
+        max_length=10,
+        choices=ENVIRONMENT_CHOICES,
+        default='PAPER',
+        help_text="Trading environment (Paper: port 7497, Live: port 7496)"
+    )
     use_algo = models.BooleanField(default=False, help_text="Use IBKR Adaptive algo")
+
+    @property
+    def port(self):
+        """Return the appropriate port based on environment"""
+        return 7497 if self.environment == 'PAPER' else 7496
 
     # Status
     status = models.CharField(max_length=20, choices=STATUS_CHOICES, default='IDLE', db_index=True)
