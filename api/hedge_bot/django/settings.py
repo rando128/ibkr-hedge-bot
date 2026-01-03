@@ -33,6 +33,7 @@ with EnvManager(ModelWDjango()) as env:
         "procrastinate.contrib.django",
         "hedge_bot.apps.people",
         "hedge_bot.apps.health",
+        "hedge_bot.apps.trading",
     ]
 
     # ---
