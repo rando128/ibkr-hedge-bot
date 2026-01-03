@@ -22,6 +22,23 @@ class Bot(models.Model):
     stop_pct = models.DecimalField(max_digits=5, decimal_places=2, help_text="Stop loss percentage")
     trailing_pct = models.DecimalField(max_digits=5, decimal_places=2, help_text="Trailing stop percentage")
 
+    # Contract configuration (IBKR Stock parameters)
+    primary_exchange = models.CharField(
+        max_length=20,
+        blank=True,
+        help_text="Primary exchange (e.g., 'NYSE', 'NASDAQ', 'SBF'). Leave blank if not needed."
+    )
+    exchange = models.CharField(
+        max_length=20,
+        default='SMART',
+        help_text="Routing exchange (usually 'SMART' for automatic routing)"
+    )
+    currency = models.CharField(
+        max_length=3,
+        default='USD',
+        help_text="Currency (e.g., 'USD', 'EUR', 'GBP')"
+    )
+
     # Account configuration
     long_account = models.CharField(max_length=50)
     short_account = models.CharField(max_length=50)

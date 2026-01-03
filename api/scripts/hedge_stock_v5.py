@@ -396,6 +396,12 @@ async def main():
     parser.add_argument('--useAlgo', action='store_true')
     parser.add_argument('--port', type=int, default=7497)
     parser.add_argument('--name', default='', help='Optional bot name')
+
+    # Contract configuration
+    parser.add_argument('--primaryExchange', default='', help='Primary exchange (e.g., SBF for AIR)')
+    parser.add_argument('--exchange', default='SMART', help='Routing exchange')
+    parser.add_argument('--currency', default='USD', help='Currency (USD, EUR, etc.)')
+
     args = parser.parse_args()
 
     # Validate inputs
@@ -421,6 +427,9 @@ async def main():
             'trailing_pct': Decimal(str(args.trailingPct)),
             'port': args.port,
             'use_algo': args.useAlgo,
+            'primary_exchange': args.primaryExchange,
+            'exchange': args.exchange,
+            'currency': args.currency,
             'status': 'IDLE'
         }
     )
@@ -432,6 +441,9 @@ async def main():
         bot.trailing_pct = Decimal(str(args.trailingPct))
         bot.port = args.port
         bot.use_algo = args.useAlgo
+        bot.primary_exchange = args.primaryExchange
+        bot.exchange = args.exchange
+        bot.currency = args.currency
         if args.name:
             bot.name = args.name
         bot.save()
@@ -452,11 +464,24 @@ async def main():
         bot.save()
         log_event('BOT_START', 'INFO', f"Bot started: {bot.symbol}")
 
-        # Contract setup
-        if args.symbol.upper() == 'AIR':
-            contract = Stock('AIR', 'SMART', 'SBF', 'EUR')
+        # Contract setup - use bot configuration
+        if bot.primary_exchange:
+            # 4-arg constructor: Stock(symbol, primaryExchange, exchange, currency)
+            contract = Stock(
+                bot.symbol.upper(),
+                bot.primary_exchange,
+                bot.exchange,
+                bot.currency
+            )
         else:
-            contract = Stock(args.symbol.upper(), 'SMART', 'USD')
+            # 3-arg constructor: Stock(symbol, exchange, currency)
+            contract = Stock(
+                bot.symbol.upper(),
+                bot.exchange,
+                bot.currency
+            )
+
+        print(f"[CONTRACT] {contract}")
         await ib.qualifyContractsAsync(contract)
         current_state['contract'] = contract
 

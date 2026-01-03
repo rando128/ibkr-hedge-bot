@@ -433,11 +433,24 @@ class BotRunner:
             await self.ib.connectAsync('127.0.0.1', self.bot.port, clientId=10)
             await self.log_event('BOT_START', 'INFO', f"Bot started: {self.bot.symbol}")
 
-            # Contract setup
-            if self.bot.symbol.upper() == 'AIR':
-                self.contract = Stock('AIR', 'SBF', 'EUR')  # Stock(symbol, exchange, currency)
+            # Contract setup - use bot configuration
+            if self.bot.primary_exchange:
+                # 4-arg constructor: Stock(symbol, primaryExchange, exchange, currency)
+                self.contract = Stock(
+                    self.bot.symbol.upper(),
+                    self.bot.primary_exchange,
+                    self.bot.exchange,
+                    self.bot.currency
+                )
             else:
-                self.contract = Stock(self.bot.symbol.upper(), 'SMART', 'USD')
+                # 3-arg constructor: Stock(symbol, exchange, currency)
+                self.contract = Stock(
+                    self.bot.symbol.upper(),
+                    self.bot.exchange,
+                    self.bot.currency
+                )
+
+            print(f"[CONTRACT] {self.contract}")
             await self.ib.qualifyContractsAsync(self.contract)
 
             details = await self.ib.reqContractDetailsAsync(self.contract)

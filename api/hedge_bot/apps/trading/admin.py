@@ -17,8 +17,12 @@ class BotAdmin(admin.ModelAdmin):
         ('Identification', {
             'fields': ('name', 'status')
         }),
+        ('Contract Configuration', {
+            'fields': ('symbol', 'primary_exchange', 'exchange', 'currency'),
+            'description': 'IBKR contract parameters. For most US stocks, use SMART/USD. For European stocks like AIR, use SBF/EUR.'
+        }),
         ('Trading Parameters', {
-            'fields': ('symbol', 'qty', 'stop_pct', 'trailing_pct')
+            'fields': ('qty', 'stop_pct', 'trailing_pct')
         }),
         ('Accounts', {
             'fields': ('long_account', 'short_account')
