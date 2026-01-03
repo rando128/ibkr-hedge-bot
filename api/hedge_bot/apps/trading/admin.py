@@ -7,7 +7,7 @@ from .tasks import start_bot, stop_bot
 
 @admin.register(Bot)
 class BotAdmin(admin.ModelAdmin):
-    list_display = ['id', 'name', 'symbol', 'qty', 'status_badge', 'cycles_count', 'last_pnl', 'created_at', 'action_buttons']
+    list_display = ['id', 'name', 'symbol', 'qty', 'status_badge', 'cycles_count', 'last_pnl', 'created_at', 'action_buttons', 'log_button']
     list_filter = ['status', 'symbol', 'created_at']
     search_fields = ['name', 'symbol', 'long_account', 'short_account']
     readonly_fields = ['created_at', 'updated_at', 'started_at', 'stopped_at']
@@ -86,6 +86,12 @@ class BotAdmin(admin.ModelAdmin):
         return '-'
     action_buttons.short_description = 'Actions'
 
+    def log_button(self, obj):
+        """Display link to bot logs"""
+        url = reverse('admin:trading_event_changelist') + f'?bot__id__exact={obj.id}'
+        return format_html('<a class="button" href="{}">Logs</a>', url)
+    log_button.short_description = 'Logs'
+
     def action_start_bots(self, request, queryset):
         """Admin action to start selected bots"""
         count = 0
@@ -120,12 +126,29 @@ class BotAdmin(admin.ModelAdmin):
         """View to start a bot"""
         from django.shortcuts import redirect
         from django.contrib import messages
+        from django.utils import timezone
+        from .tasks import run_bot_worker
 
         try:
             bot = Bot.objects.get(pk=bot_id)
             if bot.status in ('IDLE', 'STOPPED', 'ERROR'):
-                start_bot.defer(bot_id=bot.id)
-                messages.success(request, f'Bot "{bot.name or bot.symbol}" scheduled to start')
+                # Update status to RUNNING
+                bot.status = 'RUNNING'
+                bot.started_at = timezone.now()
+                bot.stopped_at = None
+                bot.save()
+
+                Event.objects.create(
+                    bot=bot,
+                    event_type='BOT_START',
+                    level='INFO',
+                    message=f"Bot start requested from admin"
+                )
+
+                # Launch worker immediately
+                run_bot_worker.defer(bot_id=bot.id)
+
+                messages.success(request, f'Bot "{bot.name or bot.symbol}" started')
             else:
                 messages.warning(request, f'Bot is already {bot.status}')
         except Bot.DoesNotExist:

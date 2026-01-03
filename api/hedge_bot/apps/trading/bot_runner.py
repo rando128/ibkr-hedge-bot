@@ -7,6 +7,7 @@ by Celery/Procrastinate tasks or management commands.
 
 import asyncio
 import math
+import random
 from datetime import datetime, timezone
 from decimal import Decimal
 from typing import Optional
@@ -18,6 +19,8 @@ from ib_insync import MarketOrder
 from .models import Bot, Cycle, Order, Execution, Event
 
 # Note: ib_insync import is delayed until inside async context to avoid event loop issues
+
+import time
 
 
 class BotRunner:
@@ -426,13 +429,20 @@ class BotRunner:
                 print(f"[ERROR] Bot status is {self.bot.status}, expected RUNNING")
                 return
 
-            # Connect to IBKR
+            # Connect to IBKR with unique client ID
+            # Formula: (timestamp_ms % 100000) + (bot_id * 100000)
+            # This ensures each bot has a unique ID that changes with every connection attempt
+            # and doesn't conflict even when multiple bots connect simultaneously
+            timestamp_component = int(time.time() * 1000) % 100000  # milliseconds, last 5 digits
+            client_id = (self.bot.id * 100000) + timestamp_component
+
             self.ib = IB()
             self.ib.errorEvent += self.on_error
             self.ib.commissionReportEvent += self.on_commission_report
 
-            await self.ib.connectAsync('127.0.0.1', self.bot.port, clientId=10)
-            await self.log_event('BOT_START', 'INFO', f"Bot started: {self.bot.symbol}")
+            print(f"[CONNECTION] Connecting to TWS with clientId={client_id} (bot_id={self.bot.id}, timestamp={timestamp_component})")
+            await self.ib.connectAsync('127.0.0.1', self.bot.port, clientId=client_id)
+            await self.log_event('BOT_START', 'INFO', f"Bot started: {self.bot.symbol} (clientId={client_id})")
 
             # Contract setup - use bot configuration
             # Stock constructor: Stock(symbol, exchange, currency)

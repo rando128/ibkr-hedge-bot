@@ -66,7 +66,7 @@ def monitor_bots(timestamp: int):
     logger.debug(f"Bot monitor: {len(running_bot_ids)} running, {len(stopped_bot_ids)} stopped")
 
 
-@app.task(queue="trading")
+@app.task
 async def run_bot_worker(bot_id: int):
     """
     Execute the bot trading logic for a specific bot.
