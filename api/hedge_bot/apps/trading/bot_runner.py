@@ -109,6 +109,7 @@ class BotRunner:
         status = await refresh_bot()
         if status != 'RUNNING':
             self.should_stop = True
+            print(f"\n[BOT] Stop detected - status changed to {status}")
             await self.log_event('BOT_STOP', 'INFO', f"Bot status changed to {status}")
             return False
         return True
@@ -488,7 +489,11 @@ class BotRunner:
 
                 if not success:
                     cycle_number += 1
-                    await asyncio.sleep(5)
+                    # Sleep with status checking (check every second)
+                    for _ in range(5):
+                        if not await self.check_bot_status():
+                            break
+                        await asyncio.sleep(1)
                     continue
 
                 # Finalize cycle
@@ -503,7 +508,11 @@ class BotRunner:
                 await self.log_event('CYCLE_COMPLETE', 'INFO', f"Cycle {cycle_number} completed with P&L: {self.cycle.net_pnl:.2f}")
 
                 print("\n>>> CYCLE COMPLETE. Waiting before next cycle...")
-                await asyncio.sleep(10)
+                # Sleep with status checking (check every second)
+                for _ in range(10):
+                    if not await self.check_bot_status():
+                        break
+                    await asyncio.sleep(1)
                 cycle_number += 1
 
         except Exception as e:
