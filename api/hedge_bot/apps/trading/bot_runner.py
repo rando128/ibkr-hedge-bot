@@ -515,21 +515,24 @@ class BotRunner:
                 success = await self._execute_cycle(min_tick, cycle_number)
 
                 if not success:
-                    print("[CYCLE] Failed or not implemented - waiting 60s before retry")
+                    print("[CYCLE] Cycle failed - setting bot to ERROR status")
                     # Mark cycle as failed
                     @sync_to_async
-                    def mark_failed():
+                    def mark_failed_and_stop():
                         self.cycle.status = 'FAILED'
                         self.cycle.completed_at = datetime.now(timezone.utc)
                         self.cycle.save()
-                    await mark_failed()
 
-                    # Sleep with status checking (check every second)
-                    for _ in range(60):
-                        if not await self.check_bot_status():
-                            break
-                        await asyncio.sleep(1)
-                    continue
+                        # Set bot to ERROR status to stop retry loop
+                        self.bot.status = 'ERROR'
+                        self.bot.stopped_at = datetime.now(timezone.utc)
+                        self.bot.save()
+
+                    await mark_failed_and_stop()
+                    await self.log_event('CYCLE_FAILED', 'ERROR', f"Cycle {cycle_number} failed, bot stopped")
+
+                    # Exit the loop - bot is now in ERROR status
+                    break
 
                 # Finalize cycle
                 @sync_to_async
