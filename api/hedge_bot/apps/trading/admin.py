@@ -63,9 +63,10 @@ class BotAdmin(admin.ModelAdmin):
         last_cycle = obj.cycles.filter(status='COMPLETED').order_by('-completed_at').first()
         if last_cycle:
             color = 'green' if last_cycle.net_pnl >= 0 else 'red'
+            pnl_value = float(last_cycle.net_pnl)
             return format_html(
-                '<span style="color: {}; font-weight: bold;">${:.2f}</span>',
-                color, last_cycle.net_pnl
+                '<span style="color: {}; font-weight: bold;">${}</span>',
+                color, f'{pnl_value:.2f}'
             )
         return '-'
     last_pnl.short_description = 'Last P&L'
@@ -136,12 +137,37 @@ class BotAdmin(admin.ModelAdmin):
         """View to stop a bot"""
         from django.shortcuts import redirect
         from django.contrib import messages
+        from django.utils import timezone
+        import logging
+
+        logger = logging.getLogger(__name__)
+        logger.info(f"[ADMIN] Stop button clicked for bot {bot_id}")
+        print(f"[ADMIN] Stop button clicked for bot {bot_id}")
 
         try:
             bot = Bot.objects.get(pk=bot_id)
+            logger.info(f"[ADMIN] Bot {bot_id} current status: {bot.status}")
+            print(f"[ADMIN] Bot {bot_id} current status: {bot.status}")
+
             if bot.status == 'RUNNING':
-                stop_bot.defer(bot_id=bot.id)
-                messages.success(request, f'Bot "{bot.name or bot.symbol}" scheduled to stop')
+                # Update status directly instead of deferring
+                logger.info(f"[ADMIN] Setting bot {bot_id} status to STOPPED directly")
+                print(f"[ADMIN] Setting bot {bot_id} status to STOPPED directly")
+
+                bot.status = 'STOPPED'
+                bot.stopped_at = timezone.now()
+                bot.save()
+
+                Event.objects.create(
+                    bot=bot,
+                    event_type='BOT_STOP',
+                    level='INFO',
+                    message=f"Bot stop requested from admin"
+                )
+
+                logger.info(f"[ADMIN] Bot {bot_id} status updated to STOPPED")
+                print(f"[ADMIN] Bot {bot_id} status updated to STOPPED")
+                messages.success(request, f'Bot "{bot.name or bot.symbol}" stopped')
             else:
                 messages.warning(request, f'Bot is not running (status: {bot.status})')
         except Bot.DoesNotExist:

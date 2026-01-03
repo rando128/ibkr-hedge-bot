@@ -140,12 +140,21 @@ def stop_bot(bot_id: int):
     bot_id : int
         The ID of the Bot to stop
     """
+    logger.info(f"[STOP_BOT_TASK] Task started for bot {bot_id}")
+    print(f"[STOP_BOT_TASK] Task started for bot {bot_id}")
+
     try:
         bot = Bot.objects.get(pk=bot_id)
+        logger.info(f"[STOP_BOT_TASK] Bot {bot_id} found, current status: {bot.status}")
+        print(f"[STOP_BOT_TASK] Bot {bot_id} found, current status: {bot.status}")
 
         if bot.status not in ('RUNNING', 'ERROR'):
-            logger.warning(f"Bot {bot_id} is not running (status: {bot.status})")
+            logger.warning(f"[STOP_BOT_TASK] Bot {bot_id} is not running (status: {bot.status})")
+            print(f"[STOP_BOT_TASK] Bot {bot_id} is not running (status: {bot.status})")
             return
+
+        logger.info(f"[STOP_BOT_TASK] Setting bot {bot_id} status to STOPPED")
+        print(f"[STOP_BOT_TASK] Setting bot {bot_id} status to STOPPED")
 
         bot.status = 'STOPPED'
         bot.stopped_at = timezone.now()
@@ -158,12 +167,15 @@ def stop_bot(bot_id: int):
             message=f"Bot stop requested"
         )
 
-        logger.info(f"Stop signal sent to bot {bot_id}")
+        logger.info(f"[STOP_BOT_TASK] Stop signal sent to bot {bot_id}, status updated to STOPPED")
+        print(f"[STOP_BOT_TASK] Stop signal sent to bot {bot_id}, status updated to STOPPED")
 
     except Bot.DoesNotExist:
-        logger.error(f"Bot {bot_id} not found")
+        logger.error(f"[STOP_BOT_TASK] Bot {bot_id} not found")
+        print(f"[STOP_BOT_TASK] Bot {bot_id} not found")
     except Exception as e:
-        logger.error(f"Failed to stop bot {bot_id}: {e}", exc_info=True)
+        logger.error(f"[STOP_BOT_TASK] Failed to stop bot {bot_id}: {e}", exc_info=True)
+        print(f"[STOP_BOT_TASK] Failed to stop bot {bot_id}: {e}")
 
 
 @app.task

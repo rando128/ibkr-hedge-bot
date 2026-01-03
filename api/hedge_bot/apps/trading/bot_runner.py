@@ -489,8 +489,9 @@ class BotRunner:
 
                 if not success:
                     cycle_number += 1
+                    print("[CYCLE] Failed or not implemented - waiting 60s before retry")
                     # Sleep with status checking (check every second)
-                    for _ in range(5):
+                    for _ in range(60):
                         if not await self.check_bot_status():
                             break
                         await asyncio.sleep(1)
@@ -540,6 +541,17 @@ class BotRunner:
     async def _execute_cycle(self, min_tick, cycle_number):
         """Execute a single hedge cycle - extracted for brevity"""
         # This would contain the full cycle logic from v5
-        # For now, returning placeholder
         # TODO: Move cycle logic from v5 here
-        return False
+
+        # For now, simulate a long-running cycle for testing
+        print("[CYCLE] Executing placeholder cycle (simulating trading activity)")
+
+        # Simulate trading for 5 minutes with status checking every 2 seconds
+        for i in range(150):  # 150 * 2s = 5 minutes
+            if not await self.check_bot_status():
+                print("[CYCLE] Stop detected during cycle execution")
+                return False
+            await asyncio.sleep(2)
+
+        print("[CYCLE] Placeholder cycle completed successfully")
+        return True
