@@ -465,21 +465,16 @@ async def main():
         log_event('BOT_START', 'INFO', f"Bot started: {bot.symbol}")
 
         # Contract setup - use bot configuration
+        # Stock constructor: Stock(symbol, exchange, currency)
+        contract = Stock(
+            bot.symbol.upper(),
+            bot.exchange,
+            bot.currency
+        )
+
+        # Set primaryExchange as attribute if specified
         if bot.primary_exchange:
-            # 4-arg constructor: Stock(symbol, primaryExchange, exchange, currency)
-            contract = Stock(
-                bot.symbol.upper(),
-                bot.primary_exchange,
-                bot.exchange,
-                bot.currency
-            )
-        else:
-            # 3-arg constructor: Stock(symbol, exchange, currency)
-            contract = Stock(
-                bot.symbol.upper(),
-                bot.exchange,
-                bot.currency
-            )
+            contract.primaryExchange = bot.primary_exchange
 
         print(f"[CONTRACT] {contract}")
         await ib.qualifyContractsAsync(contract)

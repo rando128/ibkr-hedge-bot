@@ -434,21 +434,16 @@ class BotRunner:
             await self.log_event('BOT_START', 'INFO', f"Bot started: {self.bot.symbol}")
 
             # Contract setup - use bot configuration
+            # Stock constructor: Stock(symbol, exchange, currency)
+            self.contract = Stock(
+                self.bot.symbol.upper(),
+                self.bot.exchange,
+                self.bot.currency
+            )
+
+            # Set primaryExchange as attribute if specified
             if self.bot.primary_exchange:
-                # 4-arg constructor: Stock(symbol, primaryExchange, exchange, currency)
-                self.contract = Stock(
-                    self.bot.symbol.upper(),
-                    self.bot.primary_exchange,
-                    self.bot.exchange,
-                    self.bot.currency
-                )
-            else:
-                # 3-arg constructor: Stock(symbol, exchange, currency)
-                self.contract = Stock(
-                    self.bot.symbol.upper(),
-                    self.bot.exchange,
-                    self.bot.currency
-                )
+                self.contract.primaryExchange = self.bot.primary_exchange
 
             print(f"[CONTRACT] {self.contract}")
             await self.ib.qualifyContractsAsync(self.contract)
