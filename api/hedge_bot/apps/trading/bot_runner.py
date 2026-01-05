@@ -132,8 +132,9 @@ class BotRunner:
             return
         msg = errorString if errorString else str(errorCode)
         code = errorCode if errorString else "INFO"
-        self.log_event('IBKR_ERROR', 'WARNING', f"IBKR {code}: {msg} (reqId={reqId})",
-                      data={'reqId': reqId, 'errorCode': code})
+        # Schedule async logging (can't await in sync callback)
+        asyncio.create_task(self.log_event('IBKR_ERROR', 'WARNING', f"IBKR {code}: {msg} (reqId={reqId})",
+                                          data={'reqId': reqId, 'errorCode': code}))
 
     def on_commission_report(self, trade, fill, report):
         """Handle commission reports"""
@@ -141,19 +142,30 @@ class BotRunner:
         if exec_id in self.exec_ids_seen:
             return
 
-        try:
-            execution = Execution.objects.get(exec_id=exec_id)
-            execution.commission = Decimal(str(report.commission))
-            execution.commission_currency = report.currency or 'USD'
-            execution.save()
+        # Schedule async handling (can't do sync DB operations in callback)
+        asyncio.create_task(self._handle_commission_async(exec_id, report, fill))
 
-            # Update cycle P&L
-            with transaction.atomic():
-                cycle = Cycle.objects.select_for_update().get(pk=self.cycle.pk)
-                cycle.total_commission += Decimal(str(report.commission))
-                cycle.net_pnl = cycle.total_sells - cycle.total_buys - cycle.total_commission
-                cycle.save()
-                self.cycle = cycle
+    async def _handle_commission_async(self, exec_id, report, fill):
+        """Handle commission report asynchronously"""
+        from asgiref.sync import sync_to_async
+
+        try:
+            @sync_to_async
+            def update_commission():
+                execution = Execution.objects.get(exec_id=exec_id)
+                execution.commission = Decimal(str(report.commission))
+                execution.commission_currency = report.currency or 'USD'
+                execution.save()
+
+                # Update cycle P&L
+                with transaction.atomic():
+                    cycle = Cycle.objects.select_for_update().get(pk=self.cycle.pk)
+                    cycle.total_commission += Decimal(str(report.commission))
+                    cycle.net_pnl = cycle.total_sells - cycle.total_buys - cycle.total_commission
+                    cycle.save()
+                    self.cycle = cycle
+
+            await update_commission()
 
             exec_time = self.get_safe_timestamp(fill.execution.time)
             print(f"[{self.fmt_ts(exec_time)}] [COMMISSION]: {report.commission:.2f} {report.currency}")
@@ -171,7 +183,8 @@ class BotRunner:
 
         if status.status == 'Filled':
             print(f"[TRAILING UPDATE] Account: {trade.order.account} | Status: {status.status} | EXECUTED at {status.avgFillPrice:.4f}")
-            self.log_event('TRAILING_UPDATE', 'INFO', f"Trailing stop filled at {status.avgFillPrice:.4f}")
+            # Schedule async logging (can't await in sync callback)
+            asyncio.create_task(self.log_event('TRAILING_UPDATE', 'INFO', f"Trailing stop filled at {status.avgFillPrice:.4f}"))
         else:
             price_str = f"{curr_stop:.4f}" if 0 < curr_stop < 1e10 else "Calculating..."
             print(f"[TRAILING UPDATE] Account: {trade.order.account} | Status: {status.status} | Current Stop: {price_str}")
@@ -303,64 +316,84 @@ class BotRunner:
         """Handle order fills"""
         exec_id = fill.execution.execId
 
+        print(f"[on_fill] Called for order {trade.order.orderId}, exec_id={exec_id}")
+
         if exec_id in self.exec_ids_seen:
+            print(f"[on_fill] Skipping duplicate exec_id {exec_id}")
             return
         self.exec_ids_seen.add(exec_id)
 
         # Get the Order from database
         if trade.order.orderId not in self.order_map:
-            print(f"Warning: Fill for unknown order {trade.order.orderId}")
+            print(f"[ERROR] Fill for unknown order {trade.order.orderId} - order_map has: {list(self.order_map.keys())}")
             return
 
         db_order = self.order_map[trade.order.orderId]
         exec_obj = fill.execution
 
-        # Create Execution record
+        print(f"[on_fill] Processing fill for {db_order.role} (DB id={db_order.id})")
+
+        # Schedule async handling (can't do sync DB operations in callback)
+        asyncio.create_task(self._handle_fill_async(trade, fill, exec_id, db_order))
+
+    async def _handle_fill_async(self, trade, fill, exec_id, db_order):
+        """Handle fill database operations asynchronously"""
+        from asgiref.sync import sync_to_async
+
+        exec_obj = fill.execution
         exec_time = self.get_safe_timestamp(exec_obj.time)
 
+        @sync_to_async
+        def update_fill():
+            try:
+                with transaction.atomic():
+                    execution = Execution.objects.create(
+                        order=db_order,
+                        cycle=self.cycle,
+                        exec_id=exec_id,
+                        side=exec_obj.side,
+                        shares=Decimal(str(exec_obj.shares)),
+                        price=Decimal(str(exec_obj.price)),
+                        account=trade.order.account,
+                        commission=Decimal('0'),
+                        executed_at=exec_time
+                    )
+
+                    # Update Order
+                    db_order.filled_quantity += Decimal(str(exec_obj.shares))
+                    db_order.status = trade.orderStatus.status
+                    if trade.orderStatus.avgFillPrice:
+                        db_order.avg_fill_price = Decimal(str(trade.orderStatus.avgFillPrice))
+                    if trade.orderStatus.status == 'Filled':
+                        db_order.filled_at = exec_time
+                    db_order.save()
+
+                    # Update Cycle P&L
+                    cycle = Cycle.objects.select_for_update().get(pk=self.cycle.pk)
+                    if exec_obj.side == 'BOT':  # BOT means BUY in IBKR
+                        cycle.total_buys += Decimal(str(exec_obj.shares)) * Decimal(str(exec_obj.price))
+                    else:  # SLD means SELL
+                        cycle.total_sells += Decimal(str(exec_obj.shares)) * Decimal(str(exec_obj.price))
+
+                    cycle.net_pnl = cycle.total_sells - cycle.total_buys - cycle.total_commission
+                    cycle.save()
+                    self.cycle = cycle
+
+                print(f"--- [{self.fmt_ts(exec_time)}] {db_order.role} FILLED on {trade.order.account}: {exec_obj.shares} @ {exec_obj.price:.4f} ---")
+                return True
+            except Exception as e:
+                print(f"[ERROR] Fill handling failed: {e}")
+                raise
+
         try:
-            with transaction.atomic():
-                execution = Execution.objects.create(
-                    order=db_order,
-                    cycle=self.cycle,
-                    exec_id=exec_id,
-                    side=exec_obj.side,
-                    shares=Decimal(str(exec_obj.shares)),
-                    price=Decimal(str(exec_obj.price)),
-                    account=trade.order.account,
-                    commission=Decimal('0'),
-                    executed_at=exec_time
-                )
-
-                # Update Order
-                db_order.filled_quantity += Decimal(str(exec_obj.shares))
-                db_order.status = trade.orderStatus.status
-                if trade.orderStatus.avgFillPrice:
-                    db_order.avg_fill_price = Decimal(str(trade.orderStatus.avgFillPrice))
-                if trade.orderStatus.status == 'Filled':
-                    db_order.filled_at = exec_time
-                db_order.save()
-
-                # Update Cycle P&L
-                cycle = Cycle.objects.select_for_update().get(pk=self.cycle.pk)
-                if exec_obj.side == 'BOT':  # BOT means BUY in IBKR
-                    cycle.total_buys += Decimal(str(exec_obj.shares)) * Decimal(str(exec_obj.price))
-                else:  # SLD means SELL
-                    cycle.total_sells += Decimal(str(exec_obj.shares)) * Decimal(str(exec_obj.price))
-
-                cycle.net_pnl = cycle.total_sells - cycle.total_buys - cycle.total_commission
-                cycle.save()
-                self.cycle = cycle
-
-            print(f"--- [{self.fmt_ts(exec_time)}] {db_order.role} FILLED on {trade.order.account}: {exec_obj.shares} @ {exec_obj.price:.4f} ---")
-            self.log_event('ORDER_FILLED', 'INFO', f"{db_order.role} filled: {exec_obj.shares}@{exec_obj.price:.4f}", order=db_order)
+            await update_fill()
+            await self.log_event('ORDER_FILLED', 'INFO', f"{db_order.role} filled: {exec_obj.shares}@{exec_obj.price:.4f}", order=db_order)
 
             # Trigger transition if it's a stop loss fill
             if db_order.role in ("LONG_SL", "SHORT_SL") and not self.transitioning and not self.transition_done:
-                asyncio.create_task(self.on_stop_loss_fill(trade, fill))
+                await self.on_stop_loss_fill(trade, fill)
         except Exception as e:
-            print(f"[ERROR] Fill handling failed: {e}")
-            self.log_event('SYSTEM_ERROR', 'ERROR', f"Fill handling error: {str(e)}")
+            await self.log_event('SYSTEM_ERROR', 'ERROR', f"Fill handling error: {str(e)}")
 
     async def report_pnl(self, is_final=False):
         """Generate P&L report"""
