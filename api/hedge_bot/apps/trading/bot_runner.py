@@ -480,6 +480,93 @@ class BotRunner:
             while not self.should_stop and await self.check_bot_status():
                 self.reset_cycle_state()
 
+                # CHECK FOR EXISTING ACTIVE CYCLE (from previous worker run or failed start)
+                @sync_to_async
+                def check_active_cycle():
+                    return self.bot.cycles.filter(
+                        status__in=['INITIALIZING', 'ENTERING', 'ACTIVE', 'TRANSITIONING']
+                    ).order_by('-id').first()
+
+                existing_cycle = await check_active_cycle()
+
+                if existing_cycle:
+                    print(f"\n[CYCLE CHECK] Found existing active cycle {existing_cycle.cycle_number} (status: {existing_cycle.status})")
+
+                    # PREFLIGHT CHECK: See what's holding up the old cycle
+                    print("[PREFLIGHT] Checking positions/orders from previous cycle...")
+                    positions = [p for p in self.ib.positions()
+                               if p.contract.conId == self.contract.conId
+                               and p.account in [self.bot.long_account, self.bot.short_account]
+                               and p.position != 0]
+
+                    open_orders = [t for t in self.ib.openTrades()
+                                 if t.contract.conId == self.contract.conId
+                                 and t.order.account in [self.bot.long_account, self.bot.short_account]]
+
+                    if positions:
+                        print(f"  Found {len(positions)} open positions:")
+                        for p in positions:
+                            print(f"    {p.account}: {p.position} shares @ {p.avgCost:.2f}")
+
+                    if open_orders:
+                        print(f"  Found {len(open_orders)} pending orders:")
+                        for t in open_orders:
+                            print(f"    Order {t.order.orderId} on {t.order.account}: "
+                                  f"{t.order.action} {t.order.totalQuantity} {t.order.orderType} "
+                                  f"(Status: {t.orderStatus.status})")
+
+                    if not positions and not open_orders:
+                        print(f"  No positions or orders found - marking cycle {existing_cycle.cycle_number} as COMPLETED")
+
+                        @sync_to_async
+                        def complete_orphan_cycle():
+                            existing_cycle.status = 'COMPLETED'
+                            existing_cycle.completed_at = datetime.now(timezone.utc)
+                            existing_cycle.save()
+
+                        await complete_orphan_cycle()
+                        await self.log_event('CYCLE_AUTO_COMPLETED', 'INFO',
+                                           f"Auto-completed orphan cycle {existing_cycle.cycle_number}")
+                        continue  # Now try creating a new cycle
+
+                    print(f"\n[CYCLE CHECK] Waiting 10 seconds for cycle {existing_cycle.cycle_number} to complete...")
+                    await asyncio.sleep(10)
+                    continue  # Skip to next iteration, wait for cycle to complete
+
+                # PREFLIGHT CHECK: Verify no existing positions or orders before starting new cycle
+                print("\n[PREFLIGHT] Checking for existing positions and orders...")
+                positions = [p for p in self.ib.positions()
+                           if p.contract.conId == self.contract.conId
+                           and p.account in [self.bot.long_account, self.bot.short_account]
+                           and p.position != 0]
+
+                open_orders = [t for t in self.ib.openTrades()
+                             if t.contract.conId == self.contract.conId
+                             and t.order.account in [self.bot.long_account, self.bot.short_account]]
+
+                if positions or open_orders:
+                    print(f"\n[PREFLIGHT] BLOCKED - Found existing positions/orders:")
+                    if positions:
+                        print(f"  Positions: {len(positions)}")
+                        for p in positions:
+                            print(f"    {p.account}: {p.position} shares @ {p.avgCost:.2f}")
+
+                    if open_orders:
+                        print(f"  Open Orders: {len(open_orders)}")
+                        for t in open_orders:
+                            print(f"    Order {t.order.orderId} on {t.order.account}: "
+                                  f"{t.order.action} {t.order.totalQuantity} {t.order.orderType} "
+                                  f"(Status: {t.orderStatus.status})")
+
+                    await self.log_event('PREFLIGHT_BLOCKED', 'ERROR',
+                                       f"Cycle start blocked: {len(positions)} positions, {len(open_orders)} orders found")
+
+                    print("\n[PREFLIGHT] Waiting 10 seconds before retrying preflight check...")
+                    await asyncio.sleep(10)
+                    continue  # Skip to next iteration, retry preflight check
+
+                print("[PREFLIGHT] Check passed - no positions or orders found")
+
                 # Get next cycle number and create cycle atomically
                 @sync_to_async
                 def get_or_create_next_cycle():

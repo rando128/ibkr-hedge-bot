@@ -7,7 +7,7 @@ from .tasks import start_bot, stop_bot
 
 @admin.register(Bot)
 class BotAdmin(admin.ModelAdmin):
-    list_display = ['id', 'name', 'symbol', 'qty', 'environment_badge', 'status_badge', 'cycles_count', 'last_pnl', 'created_at', 'action_buttons', 'log_button']
+    list_display = ['id', 'name', 'symbol', 'qty', 'environment_badge', 'status_badge', 'cycles_count', 'last_pnl', 'action_buttons', 'log_button']
     list_filter = ['status', 'environment', 'symbol', 'created_at']
     search_fields = ['name', 'symbol', 'long_account', 'short_account']
     readonly_fields = ['created_at', 'updated_at', 'started_at', 'stopped_at']
@@ -90,18 +90,28 @@ class BotAdmin(admin.ModelAdmin):
     last_pnl.short_description = 'Last P&L'
 
     def action_buttons(self, obj):
-        """Display start/stop buttons"""
+        """Display start/stop/panic buttons"""
+        buttons = []
+
+        # Start/Stop button
         if obj.status == 'RUNNING':
-            return format_html(
+            buttons.append(format_html(
                 '<a class="button" href="{}">Stop</a>',
                 reverse('admin:trading_bot_stop', args=[obj.pk])
-            )
-        elif obj.status in ('IDLE', 'STOPPED'):
-            return format_html(
+            ))
+        elif obj.status in ('IDLE', 'STOPPED', 'ERROR'):
+            buttons.append(format_html(
                 '<a class="button" href="{}">Start</a>',
                 reverse('admin:trading_bot_start', args=[obj.pk])
-            )
-        return '-'
+            ))
+
+        # Always show panic button (independent of status)
+        buttons.append(format_html(
+            '<a class="button" href="{}" style="background-color: #dc3545; margin-left: 5px;" onclick="return confirm(\'PANIC: This will cancel all orders and close all positions. Continue?\')">🚨</a>',
+            reverse('admin:trading_bot_panic', args=[obj.pk])
+        ))
+
+        return format_html(' '.join(buttons)) if buttons else '-'
     action_buttons.short_description = 'Actions'
 
     def log_button(self, obj):
@@ -137,6 +147,7 @@ class BotAdmin(admin.ModelAdmin):
         custom_urls = [
             path('<int:bot_id>/start/', self.admin_site.admin_view(self.start_bot_view), name='trading_bot_start'),
             path('<int:bot_id>/stop/', self.admin_site.admin_view(self.stop_bot_view), name='trading_bot_stop'),
+            path('<int:bot_id>/panic/', self.admin_site.admin_view(self.panic_bot_view), name='trading_bot_panic'),
         ]
         return custom_urls + urls
 
@@ -146,11 +157,119 @@ class BotAdmin(admin.ModelAdmin):
         from django.contrib import messages
         from django.utils import timezone
         from .tasks import run_bot_worker
+        import logging
+
+        logger = logging.getLogger(__name__)
 
         try:
             bot = Bot.objects.get(pk=bot_id)
             if bot.status in ('IDLE', 'STOPPED', 'ERROR'):
-                # Update status to RUNNING
+                # PREFLIGHT CHECK: Verify no existing positions or orders
+                def check_ibkr_state():
+                    """Check for existing positions and orders"""
+                    import asyncio
+                    import nest_asyncio
+
+                    # Create event loop for this thread
+                    loop = asyncio.new_event_loop()
+                    asyncio.set_event_loop(loop)
+                    nest_asyncio.apply(loop)
+
+                    # Import ib_insync after loop is set
+                    from ib_insync import IB, Stock
+
+                    ib = IB()
+
+                    try:
+                        # Connect to IBKR
+                        port = 7497 if bot.environment == 'PAPER' else 7496
+                        check_client_id = 998000 + bot.id
+
+                        logger.info(f"[PREFLIGHT] Connecting to TWS for preflight check...")
+                        loop.run_until_complete(
+                            ib.connectAsync('127.0.0.1', port, clientId=check_client_id, timeout=10)
+                        )
+
+                        # Set up contract
+                        contract = Stock(
+                            bot.symbol.upper(),
+                            bot.exchange,
+                            bot.currency
+                        )
+                        if bot.primary_exchange:
+                            contract.primaryExchange = bot.primary_exchange
+
+                        loop.run_until_complete(ib.qualifyContractsAsync(contract))
+
+                        # Request all open orders (including from other clients)
+                        loop.run_until_complete(ib.reqAllOpenOrdersAsync())
+                        # Give TWS time to send all orders
+                        ib.sleep(1)
+
+                        # Check for positions
+                        positions = [p for p in ib.positions()
+                                   if p.contract.conId == contract.conId
+                                   and p.account in [bot.long_account, bot.short_account]
+                                   and p.position != 0]
+
+                        # Check for open orders
+                        open_orders = [t for t in ib.openTrades()
+                                     if t.contract.conId == contract.conId
+                                     and t.order.account in [bot.long_account, bot.short_account]]
+
+                        return positions, open_orders, contract.conId
+
+                    finally:
+                        if ib.isConnected():
+                            ib.disconnect()
+                        try:
+                            loop.close()
+                        except:
+                            pass
+
+                # Run preflight check
+                try:
+                    positions, open_orders, contract_id = check_ibkr_state()
+
+                    # If there are positions or orders, block the start
+                    if positions or open_orders:
+                        error_msgs = []
+
+                        if positions:
+                            error_msgs.append(f"Found {len(positions)} open position(s):")
+                            for p in positions:
+                                error_msgs.append(f"  • {p.account}: {p.position} shares @ ${p.avgCost:.2f}")
+
+                        if open_orders:
+                            error_msgs.append(f"Found {len(open_orders)} pending order(s):")
+                            for t in open_orders:
+                                error_msgs.append(f"  • Order {t.order.orderId} on {t.order.account}: "
+                                                f"{t.order.action} {t.order.totalQuantity} {t.order.orderType} "
+                                                f"(Status: {t.orderStatus.status})")
+
+                        error_msgs.append("Please use the PANIC button to clean up before starting the bot.")
+
+                        messages.error(request, format_html('<br>'.join(error_msgs)))
+
+                        logger.warning(f"[PREFLIGHT] Bot {bot_id} start blocked due to existing positions/orders")
+
+                        Event.objects.create(
+                            bot=bot,
+                            event_type='BOT_START_BLOCKED',
+                            level='WARNING',
+                            message=f"Bot start blocked: {len(positions)} positions, {len(open_orders)} orders"
+                        )
+
+                        return redirect('admin:trading_bot_changelist')
+
+                    logger.info(f"[PREFLIGHT] Check passed - no positions or orders found (Contract ID: {contract_id})")
+
+                except Exception as e:
+                    logger.error(f"[PREFLIGHT] Check failed: {e}", exc_info=True)
+                    messages.error(request, f'Preflight check failed: {str(e)}. Cannot start bot.')
+                    return redirect('admin:trading_bot_changelist')
+
+                # Preflight passed - start the bot
                 bot.status = 'RUNNING'
                 bot.started_at = timezone.now()
                 bot.stopped_at = None
@@ -160,13 +279,13 @@ class BotAdmin(admin.ModelAdmin):
                     bot=bot,
                     event_type='BOT_START',
                     level='INFO',
-                    message=f"Bot start requested from admin"
+                    message=f"Bot start requested from admin (preflight check passed)"
                 )
 
                 # Launch worker immediately
                 run_bot_worker.defer(bot_id=bot.id)
 
-                messages.success(request, f'Bot "{bot.name or bot.symbol}" started')
+                messages.success(request, f'Bot "{bot.name or bot.symbol}" started (preflight check passed)')
             else:
                 messages.warning(request, f'Bot is already {bot.status}')
         except Bot.DoesNotExist:
@@ -216,6 +335,199 @@ class BotAdmin(admin.ModelAdmin):
 
         return redirect('admin:trading_bot_changelist')
 
+    def panic_bot_view(self, request, bot_id):
+        """
+        PANIC BUTTON: Emergency stop that:
+        1. Cancels all pending orders for this bot's accounts
+        2. Closes all open positions for this bot's accounts
+        3. Stops the bot
+        """
+        from django.shortcuts import redirect
+        from django.contrib import messages
+        from django.utils import timezone
+        import logging
+
+        logger = logging.getLogger(__name__)
+        logger.warning(f"[PANIC] Panic button pressed for bot {bot_id}")
+
+        try:
+            bot = Bot.objects.get(pk=bot_id)
+
+            # Run panic in sync context with new event loop
+            def execute_panic():
+                """Execute panic operations synchronously"""
+                import asyncio
+                import nest_asyncio
+
+                # Create a new event loop for this thread FIRST
+                loop = asyncio.new_event_loop()
+                asyncio.set_event_loop(loop)
+
+                # Allow nested event loops (ib_insync compatibility)
+                nest_asyncio.apply(loop)
+
+                # NOW import ib_insync after loop is set
+                from ib_insync import IB, Stock, MarketOrder
+
+                ib = IB()
+
+                # Don't call util.patchAsyncio() - we're managing the loop ourselves
+
+                try:
+                    # Connect to IBKR synchronously (ib_insync will use our loop)
+                    port = 7497 if bot.environment == 'PAPER' else 7496
+                    # Use Master Client ID (0) to cancel orders from any client
+                    panic_client_id = 0
+
+                    logger.info(f"[PANIC] Connecting to TWS on port {port} with Master clientId={panic_client_id}")
+
+                    # Run connect in the loop we created
+                    loop.run_until_complete(
+                        ib.connectAsync('127.0.0.1', port, clientId=panic_client_id, timeout=10)
+                    )
+
+                    # Set up contract
+                    contract = Stock(
+                        bot.symbol.upper(),
+                        bot.exchange,
+                        bot.currency
+                    )
+                    if bot.primary_exchange:
+                        contract.primaryExchange = bot.primary_exchange
+
+                    loop.run_until_complete(ib.qualifyContractsAsync(contract))
+
+                    # Request all open orders (including from other clients)
+                    loop.run_until_complete(ib.reqAllOpenOrdersAsync())
+                    # Give TWS time to send all orders
+                    ib.sleep(1)
+
+                    cancelled_orders = 0
+                    closed_positions = 0
+
+                    # 1. Cancel all open orders for this bot's accounts
+                    print(f"[PANIC] Checking for open orders...")
+                    logger.info(f"[PANIC] Checking for open orders...")
+                    print(f"[PANIC] Found {len(ib.openTrades())} total open trades")
+                    logger.info(f"[PANIC] Found {len(ib.openTrades())} total open trades")
+
+                    # Count orders that need cancellation
+                    orders_for_this_bot = []
+                    for trade in ib.openTrades():
+                        if (trade.contract.conId == contract.conId and
+                            trade.order.account in [bot.long_account, bot.short_account]):
+                            print(f"[PANIC] Found order {trade.order.orderId} "
+                                  f"({trade.order.orderType} {trade.order.action} {trade.order.totalQuantity}) "
+                                  f"on {trade.order.account} - placed by client {trade.order.clientId}")
+                            orders_for_this_bot.append(trade)
+                            cancelled_orders += 1
+
+                    print(f"[PANIC] Total orders to cancel: {cancelled_orders}")
+
+                    # Use Master Client ID (0) to cancel orders placed by any client
+                    if cancelled_orders > 0:
+                        print(f"[PANIC] Using reqGlobalCancel to cancel ALL orders...")
+                        logger.warning(f"[PANIC] Using reqGlobalCancel to cancel ALL orders")
+
+                        # reqGlobalCancel() cancels ALL orders for ALL accounts on this API connection
+                        # This is the nuclear option but it works across all clients
+                        ib.reqGlobalCancel()
+
+                        print(f"[PANIC] Waiting for {cancelled_orders} order cancellations...")
+                        logger.info(f"[PANIC] Waiting for {cancelled_orders} order cancellations...")
+                        ib.sleep(3)
+
+                        # Re-fetch all orders to check status
+                        loop.run_until_complete(ib.reqAllOpenOrdersAsync())
+                        ib.sleep(1)
+
+                        # Verify cancellations
+                        still_open_count = 0
+                        for trade in ib.openTrades():
+                            if (trade.contract.conId == contract.conId and
+                                trade.order.account in [bot.long_account, bot.short_account]):
+                                print(f"[PANIC] ⚠ Order {trade.order.orderId} still open, status: {trade.orderStatus.status}")
+                                logger.warning(f"[PANIC] Order {trade.order.orderId} still open")
+                                still_open_count += 1
+
+                        if still_open_count > 0:
+                            print(f"[PANIC] ⚠ {still_open_count} orders still open after cancellation attempt")
+                            logger.warning(f"[PANIC] {still_open_count} orders still open after cancellation attempt")
+                        else:
+                            print(f"[PANIC] ✓ All {cancelled_orders} orders successfully cancelled")
+                            logger.info(f"[PANIC] All {cancelled_orders} orders successfully cancelled")
+                    else:
+                        print("[PANIC] No orders matched for cancellation")
+
+                    # 2. Close all positions for this bot's accounts
+                    logger.info(f"[PANIC] Checking for open positions...")
+                    for position in ib.positions():
+                        if (position.contract.conId == contract.conId and
+                            position.account in [bot.long_account, bot.short_account] and
+                            position.position != 0):
+
+                            qty = abs(position.position)
+                            action = 'SELL' if position.position > 0 else 'BUY'
+
+                            logger.warning(f"[PANIC] Closing position on {position.account}: {action} {qty} shares")
+
+                            # Place market order to close
+                            order = MarketOrder(action, qty, account=position.account)
+                            ib.placeOrder(contract, order)
+                            closed_positions += 1
+
+                    # Wait for fills
+                    if closed_positions > 0:
+                        logger.info(f"[PANIC] Waiting for {closed_positions} position closures...")
+                        ib.sleep(3)
+
+                    return cancelled_orders, closed_positions
+
+                except Exception as e:
+                    logger.error(f"[PANIC] Error during panic operations: {e}", exc_info=True)
+                    raise
+                finally:
+                    if ib.isConnected():
+                        ib.disconnect()
+                        logger.info("[PANIC] Disconnected from TWS")
+
+                    # Clean up event loop
+                    try:
+                        loop.close()
+                    except:
+                        pass
+
+            # Execute panic
+            try:
+                cancelled_orders, closed_positions = execute_panic()
+
+                # 3. Stop the bot
+                bot.status = 'STOPPED'
+                bot.stopped_at = timezone.now()
+                bot.save()
+
+                Event.objects.create(
+                    bot=bot,
+                    event_type='PANIC_STOP',
+                    level='CRITICAL',
+                    message=f"PANIC: Cancelled {cancelled_orders} orders, closed {closed_positions} positions"
+                )
+
+                messages.warning(
+                    request,
+                    f'PANIC executed for "{bot.name or bot.symbol}": '
+                    f'Cancelled {cancelled_orders} orders, closed {closed_positions} positions, bot stopped'
+                )
+
+            except Exception as e:
+                logger.error(f"[PANIC] Failed to execute panic: {e}", exc_info=True)
+                messages.error(request, f'PANIC failed: {str(e)}')
+
+        except Bot.DoesNotExist:
+            messages.error(request, 'Bot not found')
+
+        return redirect('admin:trading_bot_changelist')
+
 
 @admin.register(Cycle)
 class CycleAdmin(admin.ModelAdmin):
@@ -255,3 +567,29 @@ class EventAdmin(admin.ModelAdmin):
     def message_preview(self, obj):
         return obj.message[:50]
     message_preview.short_description = 'Message'
+
+
+# Custom admin view for chart
+from django.urls import path
+from django.shortcuts import render
+from django.contrib.admin.views.decorators import staff_member_required
+
+@staff_member_required
+def chart_view(request):
+    return render(request, 'admin/chart.html', {
+        'title': 'Trading Chart',
+        'site_header': admin.site.site_header,
+        'site_title': admin.site.site_title,
+        'has_permission': True,
+    })
+
+# Add custom URL to admin site
+_original_get_urls = admin.site.get_urls
+
+def custom_get_urls():
+    custom_urls = [
+        path('chart/', chart_view, name='trading_chart'),
+    ]
+    return custom_urls + _original_get_urls()
+
+admin.site.get_urls = custom_get_urls
