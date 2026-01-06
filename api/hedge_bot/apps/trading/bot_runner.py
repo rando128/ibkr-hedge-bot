@@ -46,6 +46,10 @@ class BotRunner:
 
         # Heartbeat tracking (for stale worker detection)
         self.last_heartbeat = 0  # timestamp of last heartbeat
+        self.last_reconnect_attempt = 0
+        self.client_id = None
+        self.host = '127.0.0.1'
+        self.port = None
 
         # Note: Signal handlers don't work in worker threads
         # Instead, we poll bot.status in check_bot_status() method
@@ -145,6 +149,72 @@ class BotRunner:
 
         await update_heartbeat()
 
+    async def ensure_connection(self):
+        """Ensure IB connection is alive; attempt reconnection and rehydration on failure."""
+        import time
+
+        if self.ib and self.ib.isConnected():
+            return True
+
+        # Simple backoff to avoid hammering reconnect attempts
+        now = time.time()
+        if now - self.last_reconnect_attempt < 5:
+            return False
+
+        self.last_reconnect_attempt = now
+        try:
+            print("[IBKR] Connection lost. Attempting reconnect...")
+            await self.ib.connectAsync(self.host, self.port, clientId=self.client_id)
+
+            # Rehydrate positions/orders so callbacks can be reattached
+            await self.ib.reqPositionsAsync()
+            await self.ib.reqOpenOrdersAsync()
+            await asyncio.sleep(0.5)
+            await self.rehydrate_open_trades()
+            await self.log_event('IBKR_ERROR', 'WARNING', "Reconnected to IBKR after disconnect")
+            print("[IBKR] Reconnected and rehydrated open orders/positions.")
+            return True
+        except Exception as e:
+            print(f"[IBKR] Reconnect failed: {e}")
+            await self.log_event('IBKR_ERROR', 'ERROR', f"Reconnect failed: {e}")
+            return False
+
+    async def rehydrate_open_trades(self):
+        """
+        Re-attach callbacks to open trades after a reconnect so stop losses/trailing stops keep working.
+        """
+        if not self.cycle:
+            return
+
+        # Refresh open orders snapshot
+        open_trades = [
+            t for t in self.ib.openTrades()
+            if t.contract.conId == self.contract.conId
+            and t.order.account in [self.bot.long_account, self.bot.short_account]
+        ]
+
+        order_ids = [t.order.orderId for t in open_trades]
+
+        @sync_to_async
+        def fetch_db_orders():
+            return {o.order_id: o for o in self.cycle.orders.filter(order_id__in=order_ids)}
+
+        db_orders = await fetch_db_orders()
+
+        for t in open_trades:
+            db_order = self.order_map.get(t.order.orderId) or db_orders.get(t.order.orderId)
+            if not db_order:
+                continue
+
+            self.order_map[t.order.orderId] = db_order
+            t.fillEvent += self.on_fill
+
+            # Track active protection orders
+            if db_order.role in ('LONG_SL', 'LONG_TRAIL'):
+                self.active_trades['long'] = t
+            elif db_order.role in ('SHORT_SL', 'SHORT_TRAIL'):
+                self.active_trades['short'] = t
+
     async def check_bot_status(self):
         """Check if bot should continue running and send heartbeat"""
         @sync_to_async
@@ -156,6 +226,12 @@ class BotRunner:
 
         # Send heartbeat while checking status
         await self.send_heartbeat()
+
+        # Verify IB connection; attempt reconnect when needed
+        if not await self.ensure_connection():
+            self.should_stop = True
+            await self.log_event('SYSTEM_ERROR', 'ERROR', "IBKR connection lost and reconnect failed")
+            return False
 
         if status != 'RUNNING':
             self.should_stop = True
@@ -559,15 +635,16 @@ class BotRunner:
             # This ensures each bot has a unique ID that changes with every connection attempt
             # and doesn't conflict even when multiple bots connect simultaneously
             timestamp_component = int(time.time() * 1000) % 100000  # milliseconds, last 5 digits
-            client_id = (self.bot.id * 100000) + timestamp_component
+            self.client_id = (self.bot.id * 100000) + timestamp_component
+            self.port = self.bot.port
 
             self.ib = IB()
             self.ib.errorEvent += self.on_error
             self.ib.commissionReportEvent += self.on_commission_report
 
-            print(f"[CONNECTION] Connecting to TWS with clientId={client_id} (bot_id={self.bot.id}, timestamp={timestamp_component})")
-            await self.ib.connectAsync('127.0.0.1', self.bot.port, clientId=client_id)
-            await self.log_event('BOT_START', 'INFO', f"Bot started: {self.bot.symbol} (clientId={client_id})")
+            print(f"[CONNECTION] Connecting to TWS with clientId={self.client_id} (bot_id={self.bot.id}, timestamp={timestamp_component})")
+            await self.ib.connectAsync(self.host, self.port, clientId=self.client_id)
+            await self.log_event('BOT_START', 'INFO', f"Bot started: {self.bot.symbol} (clientId={self.client_id})")
 
             # Contract setup - use bot configuration
             # Stock constructor: Stock(symbol, exchange, currency)
