@@ -425,6 +425,7 @@ class BotRunner:
                 orderRef=f"C{self.cycle.cycle_number}_{label}_TRAIL"
             )
             t_trade = self.ib.placeOrder(self.contract, trail_order)
+            t_trade.fillEvent += self.on_fill
             t_trade.statusEvent += self.on_trailing_stop_status
             self.active_trades[surviving_leg] = t_trade
 
