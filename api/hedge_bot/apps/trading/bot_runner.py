@@ -8,7 +8,7 @@ by Celery/Procrastinate tasks or management commands.
 import asyncio
 import math
 import random
-from datetime import datetime, timezone
+from datetime import datetime, timezone, timedelta
 from decimal import Decimal
 from typing import Optional
 
@@ -171,6 +171,9 @@ class BotRunner:
             await self.ib.reqOpenOrdersAsync()
             await asyncio.sleep(0.5)
             await self.rehydrate_open_trades()
+            # On reconnect, backfill any executions that happened while we were down and reconcile DB state
+            await self.backfill_executions()
+            await self.reconcile_cycle_state()
             await self.log_event('IBKR_ERROR', 'WARNING', "Reconnected to IBKR after disconnect")
             print("[IBKR] Reconnected and rehydrated open orders/positions.")
             return True
@@ -214,6 +217,213 @@ class BotRunner:
                 self.active_trades['long'] = t
             elif db_order.role in ('SHORT_SL', 'SHORT_TRAIL'):
                 self.active_trades['short'] = t
+
+    async def backfill_executions(self):
+        """
+        Pull recent executions from IBKR and reconcile any fills that happened while the worker was down.
+        This helps capture stop-loss executions that were missed during downtime.
+        """
+        if not self.cycle or not self.contract:
+            return 0
+
+        from ib_insync import ExecutionFilter
+        from django.utils import timezone as dj_timezone
+
+        # Look slightly before the last known execution to ensure we don't miss anything
+        @sync_to_async
+        def get_backfill_start():
+            last_exec = self.cycle.executions.order_by('-executed_at').first()
+            anchor = last_exec.executed_at if last_exec else (self.cycle.created_at or dj_timezone.now())
+            return (anchor - timedelta(minutes=5)).astimezone(timezone.utc)
+
+        start_dt = await get_backfill_start()
+        start_str = start_dt.strftime('%Y%m%d %H:%M:%S')
+
+        accounts = [self.bot.long_account, self.bot.short_account]
+        filters = [
+            ExecutionFilter(acctCode=acc, symbol=self.contract.symbol, time=start_str)
+            for acc in accounts
+        ]
+
+        new_execs = 0
+
+        @sync_to_async
+        def execution_exists(exec_id):
+            return Execution.objects.filter(exec_id=exec_id).exists()
+
+        @sync_to_async
+        def find_order(perm_id, order_id, account):
+            qs = self.cycle.orders.filter(account=account)
+            if perm_id:
+                order = qs.filter(perm_id=perm_id).first()
+                if order:
+                    return order
+            return qs.filter(order_id=order_id).first()
+
+        @sync_to_async
+        def persist_execution(order, exec_report, exec_time):
+            side_map = {'BOT': 'BUY', 'SLD': 'SELL'}
+            side = side_map.get(exec_report.side, exec_report.side)
+            shares = Decimal(str(exec_report.shares))
+            price = Decimal(str(exec_report.price))
+            avg_price = Decimal(str(exec_report.avgPrice or exec_report.price or 0))
+
+            with transaction.atomic():
+                # Lock related rows to keep totals consistent
+                order_locked = Order.objects.select_for_update().get(pk=order.pk)
+                cycle_locked = Cycle.objects.select_for_update().get(pk=order_locked.cycle_id)
+
+                Execution.objects.create(
+                    order=order_locked,
+                    cycle=cycle_locked,
+                    exec_id=exec_report.execId,
+                    side=side,
+                    shares=shares,
+                    price=price,
+                    account=exec_report.acctNumber,
+                    executed_at=exec_time
+                )
+
+                order_locked.filled_quantity += shares
+                order_locked.status = 'Filled' if order_locked.filled_quantity >= order_locked.total_quantity else 'PartiallyFilled'
+                order_locked.avg_fill_price = avg_price
+                if getattr(exec_report, 'permId', None):
+                    order_locked.perm_id = getattr(exec_report, 'permId')
+                if order_locked.status == 'Filled':
+                    order_locked.filled_at = exec_time
+                order_locked.save()
+
+                if side == 'BUY':
+                    cycle_locked.total_buys += shares * price
+                else:
+                    cycle_locked.total_sells += shares * price
+
+                cycle_locked.net_pnl = cycle_locked.total_sells - cycle_locked.total_buys - cycle_locked.total_commission
+                cycle_locked.save()
+
+                return order_locked, cycle_locked
+
+        for flt in filters:
+            try:
+                reports = await self.ib.reqExecutionsAsync(flt)
+            except Exception as e:
+                await self.log_event('SYSTEM_ERROR', 'ERROR', f"Execution backfill failed: {e}")
+                continue
+
+            for rpt in reports:
+                exec_id = rpt.execId
+
+                # Skip duplicates already seen/recorded
+                if exec_id in self.exec_ids_seen or await execution_exists(exec_id):
+                    self.exec_ids_seen.add(exec_id)
+                    continue
+
+                order = await find_order(getattr(rpt, 'permId', None), getattr(rpt, 'orderId', None), getattr(rpt, 'acctNumber', None))
+                if not order:
+                    await self.log_event(
+                        'EXECUTION_BACKFILL_MISSING_ORDER',
+                        'WARNING',
+                        f"Execution {exec_id} has no matching order (permId={getattr(rpt, 'permId', None)}, orderId={getattr(rpt, 'orderId', None)}, account={getattr(rpt, 'acctNumber', None)})"
+                    )
+                    continue
+
+                exec_time = self.get_safe_timestamp(getattr(rpt, 'time', None))
+                try:
+                    order_locked, cycle_locked = await persist_execution(order, rpt, exec_time)
+                    self.order_map[order_locked.order_id] = order_locked
+                    self.cycle = cycle_locked
+                    self.exec_ids_seen.add(exec_id)
+                    new_execs += 1
+                except Exception as e:
+                    await self.log_event('SYSTEM_ERROR', 'ERROR', f"Failed to persist backfilled execution {exec_id}: {e}")
+
+        if new_execs:
+            await self.log_event('EXECUTION_BACKFILLED', 'INFO', f"Backfilled {new_execs} executions from IBKR")
+
+        return new_execs
+
+    async def reconcile_cycle_state(self):
+        """
+        Reconcile DB orders/cycle against current IB open trades to repair stale statuses after downtime.
+        """
+        if not self.cycle:
+            return 0
+
+        open_trades = [
+            t for t in self.ib.openTrades()
+            if t.contract.conId == self.contract.conId
+            and t.order.account in [self.bot.long_account, self.bot.short_account]
+        ]
+        open_map = {t.order.orderId: t for t in open_trades}
+        pending_statuses = {'PendingSubmit', 'PreSubmitted', 'Submitted', 'PartiallyFilled'}
+        updates = 0
+
+        @sync_to_async
+        def load_orders():
+            return list(self.cycle.orders.select_related('cycle').prefetch_related('executions'))
+
+        orders = await load_orders()
+
+        for order in orders:
+            trade = open_map.get(order.order_id)
+            if trade:
+                status = trade.orderStatus.status
+                filled_qty = Decimal(str(trade.orderStatus.filled or 0))
+                avg_price = Decimal(str(trade.orderStatus.avgFillPrice or order.avg_fill_price or 0))
+                perm_id = getattr(trade.order, 'permId', None)
+
+                @sync_to_async
+                def update_open_order():
+                    changed = False
+                    if order.status != status:
+                        order.status = status
+                        changed = True
+                    if order.filled_quantity != filled_qty:
+                        order.filled_quantity = filled_qty
+                        changed = True
+                    if avg_price and order.avg_fill_price != avg_price:
+                        order.avg_fill_price = avg_price
+                        changed = True
+                    if perm_id and order.perm_id != perm_id:
+                        order.perm_id = perm_id
+                        changed = True
+                    if changed:
+                        order.save()
+                    return changed
+
+                if await update_open_order():
+                    updates += 1
+                continue
+
+            # No open trade for this order - align status with executions
+            if order.status in pending_statuses:
+                last_exec = max(order.executions.all(), key=lambda e: e.executed_at) if order.executions.exists() else None
+                new_status = None
+                if order.filled_quantity >= order.total_quantity and order.total_quantity > 0:
+                    new_status = 'Filled'
+                elif order.filled_quantity > 0:
+                    new_status = 'PartiallyFilled'
+
+                if new_status:
+                    @sync_to_async
+                    def mark_filled():
+                        order.status = new_status
+                        if last_exec:
+                            order.avg_fill_price = last_exec.price
+                            order.filled_at = last_exec.executed_at
+                        order.save()
+                    await mark_filled()
+                    updates += 1
+
+        if updates:
+            # Refresh P&L to reflect any recovered fills
+            @sync_to_async
+            def refresh_pnl():
+                self.cycle.update_pnl()
+                self.cycle.refresh_from_db()
+            await refresh_pnl()
+            await self.log_event('CYCLE_RECONCILED', 'WARNING', f"Reconciled {updates} orders with IB snapshot")
+        return updates
 
     async def check_bot_status(self):
         """Check if bot should continue running and send heartbeat"""
@@ -519,6 +729,9 @@ class BotRunner:
                     db_order.status = trade.orderStatus.status
                     if trade.orderStatus.avgFillPrice:
                         db_order.avg_fill_price = Decimal(str(trade.orderStatus.avgFillPrice))
+                    perm_id = getattr(exec_obj, 'permId', None)
+                    if perm_id:
+                        db_order.perm_id = perm_id
                     if trade.orderStatus.status == 'Filled':
                         db_order.filled_at = exec_time
                     db_order.save()
@@ -731,6 +944,10 @@ class BotRunner:
                     # RECOVERY: Re-attach to existing cycle and restore state
                     print(f"\n[RECOVERY] Attempting to recover cycle {existing_cycle.cycle_number}...")
                     self.cycle = existing_cycle
+
+                    # Backfill any executions that may have been missed while the worker was down
+                    await self.backfill_executions()
+                    await self.reconcile_cycle_state()
 
                     # Load existing orders from database and map to open trades
                     @sync_to_async
