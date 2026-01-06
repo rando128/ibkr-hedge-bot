@@ -299,8 +299,7 @@ class BotRunner:
         await asyncio.sleep(0.5)
         open_orders = [
             o for o in self.ib.openOrders()
-            if o.contract.conId == self.contract.conId
-            and o.account in accounts
+            if o.account in accounts
         ]
 
         @sync_to_async
@@ -536,8 +535,7 @@ class BotRunner:
         # Use both openOrders (true live orders) and openTrades (for status/fill details)
         open_orders = [
             o for o in self.ib.openOrders()
-            if o.contract.conId == self.contract.conId
-            and o.account in [self.bot.long_account, self.bot.short_account]
+            if o.account in [self.bot.long_account, self.bot.short_account]
         ]
         open_trades = [
             t for t in self.ib.openTrades()
@@ -1186,14 +1184,12 @@ class BotRunner:
                                    and t.order.account in [self.bot.long_account, self.bot.short_account]]
 
                     open_orders = [o for o in self.ib.openOrders()
-                                   if o.contract.conId == self.contract.conId
-                                   and o.account in [self.bot.long_account, self.bot.short_account]]
+                                   if o.account in [self.bot.long_account, self.bot.short_account]]
                     # Refresh open orders snapshot to catch pending orders immediately after restart
                     await self.ib.reqOpenOrdersAsync()
                     await asyncio.sleep(0.5)
                     open_orders = [o for o in self.ib.openOrders()
-                                   if o.contract.conId == self.contract.conId
-                                   and o.account in [self.bot.long_account, self.bot.short_account]]
+                                   if o.account in [self.bot.long_account, self.bot.short_account]]
 
                     if positions:
                         print(f"  Found {len(positions)} open positions:")
@@ -1240,8 +1236,7 @@ class BotRunner:
                                    if t.contract.conId == self.contract.conId
                                    and t.order.account in [self.bot.long_account, self.bot.short_account]]
                     open_orders = [o for o in self.ib.openOrders()
-                                   if o.contract.conId == self.contract.conId
-                                   and o.account in [self.bot.long_account, self.bot.short_account]]
+                                   if o.account in [self.bot.long_account, self.bot.short_account]]
 
                     # Build lookup helpers for matching even if orderIds changed or only permId/orderRef is available
                     trade_by_order_id = {t.order.orderId: t for t in open_trades}
