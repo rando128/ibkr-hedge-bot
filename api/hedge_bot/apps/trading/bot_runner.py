@@ -170,6 +170,11 @@ class BotRunner:
         from asgiref.sync import sync_to_async
 
         try:
+            # Skip if no active cycle
+            if not self.cycle:
+                print(f"[WARNING] Commission report received but no active cycle for exec_id {exec_id}")
+                return
+
             @sync_to_async
             def update_commission():
                 execution = Execution.objects.get(exec_id=exec_id)
@@ -211,6 +216,8 @@ class BotRunner:
 
     async def on_stop_loss_fill(self, trade, fill):
         """Handle stop loss fill and transition to trailing stop"""
+        from ib_insync import Order as IBOrder, MarketOrder
+
         if self.transitioning or self.transition_done:
             return
         self.transitioning = True
@@ -337,8 +344,13 @@ class BotRunner:
         finally:
             if transitioned:
                 self.transition_done = True
-                self.cycle.status = 'ACTIVE'
-                self.cycle.save()
+
+                @sync_to_async
+                def update_cycle_status():
+                    self.cycle.status = 'ACTIVE'
+                    self.cycle.save()
+
+                await update_cycle_status()
             self.transitioning = False
 
     def on_fill(self, trade, fill):
