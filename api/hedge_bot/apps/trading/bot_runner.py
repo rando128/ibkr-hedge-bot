@@ -237,7 +237,8 @@ class BotRunner:
             return (anchor - timedelta(minutes=5)).astimezone(timezone.utc)
 
         start_dt = await get_backfill_start()
-        start_str = start_dt.strftime('%Y%m%d %H:%M:%S')
+        # Use explicit UTC format to avoid IBKR warning about implied time zones
+        start_str = start_dt.strftime('%Y%m%d-%H:%M:%S')
 
         accounts = [self.bot.long_account, self.bot.short_account]
         filters = [
@@ -324,7 +325,7 @@ class BotRunner:
                 exec_time_raw = getattr(exec_obj, 'time', None)
 
                 if not exec_id:
-                    await self.log_event('EXECUTION_BACKFILL_MISSING_ID', 'WARNING', f"Skipping execution without execId (orderId={order_id}, account={account})")
+                    await self.log_event('BACKFILL_SKIP_NO_ID', 'WARNING', f"Skipping execution without execId (orderId={order_id}, account={account})")
                     continue
 
                 # Skip duplicates already seen/recorded
@@ -335,7 +336,7 @@ class BotRunner:
                 order = await find_order(perm_id, order_id, account)
                 if not order:
                     await self.log_event(
-                        'EXECUTION_BACKFILL_MISSING_ORDER',
+                        'BACKFILL_MISSING_ORDER',
                         'WARNING',
                         f"Execution {exec_id} has no matching order (permId={perm_id}, orderId={order_id}, account={account})"
                     )
@@ -365,7 +366,7 @@ class BotRunner:
                     await self.log_event('SYSTEM_ERROR', 'ERROR', f"Failed to persist backfilled execution {exec_id}: {e}")
 
         if new_execs:
-            await self.log_event('EXECUTION_BACKFILLED', 'INFO', f"Backfilled {new_execs} executions from IBKR")
+            await self.log_event('BACKFILL_APPLIED', 'INFO', f"Backfilled {new_execs} executions from IBKR")
 
         return new_execs
 
@@ -376,12 +377,20 @@ class BotRunner:
         if not self.cycle:
             return 0
 
+        # Use both openOrders (true live orders) and openTrades (for status/fill details)
+        open_orders = [
+            o for o in self.ib.openOrders()
+            if o.contract.conId == self.contract.conId
+            and o.account in [self.bot.long_account, self.bot.short_account]
+        ]
         open_trades = [
             t for t in self.ib.openTrades()
             if t.contract.conId == self.contract.conId
             and t.order.account in [self.bot.long_account, self.bot.short_account]
         ]
-        open_map = {t.order.orderId: t for t in open_trades}
+
+        open_orders_map = {o.orderId: o for o in open_orders}
+        open_trades_map = {t.order.orderId: t for t in open_trades}
         pending_statuses = {'PendingSubmit', 'PreSubmitted', 'Submitted', 'PartiallyFilled'}
         updates = 0
 
@@ -392,12 +401,20 @@ class BotRunner:
         orders = await load_orders()
 
         for order in orders:
-            trade = open_map.get(order.order_id)
-            if trade:
-                status = trade.orderStatus.status
-                filled_qty = Decimal(str(trade.orderStatus.filled or 0))
-                avg_price = Decimal(str(trade.orderStatus.avgFillPrice or order.avg_fill_price or 0))
-                perm_id = getattr(trade.order, 'permId', None)
+            trade = open_trades_map.get(order.order_id)
+            open_order = open_orders_map.get(order.order_id)
+            if trade or open_order:
+                if trade:
+                    status = trade.orderStatus.status
+                    filled_qty = Decimal(str(trade.orderStatus.filled or 0))
+                    avg_price = Decimal(str(trade.orderStatus.avgFillPrice or order.avg_fill_price or 0))
+                    perm_id = getattr(trade.order, 'permId', None)
+                else:
+                    # We have an open order but no trade object; treat as submitted
+                    status = 'Submitted' if order.status in ('PendingSubmit', 'PreSubmitted') else order.status
+                    filled_qty = order.filled_quantity
+                    avg_price = order.avg_fill_price
+                    perm_id = getattr(open_order, 'permId', None)
 
                 @sync_to_async
                 def update_open_order():

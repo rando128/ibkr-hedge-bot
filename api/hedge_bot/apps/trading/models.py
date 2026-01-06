@@ -289,6 +289,10 @@ class Event(models.Model):
         ('IBKR_ERROR', 'IBKR Error'),
         ('SYSTEM_ERROR', 'System Error'),
         ('PNL_REPORT', 'P&L Report'),
+        ('BACKFILL_APPLIED', 'Executions Backfilled'),
+        ('BACKFILL_SKIP_NO_ID', 'Backfill Skipped Missing ID'),
+        ('BACKFILL_MISSING_ORDER', 'Backfill Missing Order'),
+        ('CYCLE_RECONCILED', 'Cycle Reconciled'),
     ]
 
     bot = models.ForeignKey(Bot, on_delete=models.CASCADE, related_name='events', null=True, blank=True)
