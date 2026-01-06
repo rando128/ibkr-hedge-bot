@@ -70,6 +70,8 @@ class Bot(models.Model):
                                      help_text="Procrastinate task ID of the running worker (for multi-worker deduplication)")
     worker_started_at = models.DateTimeField(null=True, blank=True,
                                             help_text="When the current worker task started")
+    worker_last_heartbeat = models.DateTimeField(null=True, blank=True,
+                                                 help_text="Last heartbeat from the worker (updated every 30s)")
 
     # Timestamps
     created_at = models.DateTimeField(auto_now_add=True)

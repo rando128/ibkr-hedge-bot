@@ -50,8 +50,10 @@ def monitor_bots(timestamp: int):
 
                 # Double-check no worker was assigned in the meantime
                 if not bot_locked.worker_task_id and bot_locked.status == 'RUNNING':
+                    now = timezone.now()
                     bot_locked.worker_task_id = task_id
-                    bot_locked.worker_started_at = timezone.now()
+                    bot_locked.worker_started_at = now
+                    bot_locked.worker_last_heartbeat = now  # Initial heartbeat
                     bot_locked.save()
 
                     # Schedule the bot worker task
@@ -64,17 +66,22 @@ def monitor_bots(timestamp: int):
                         message=f"Bot worker launched for {bot_locked.symbol}"
                     )
         else:
-            # Has worker - check if it's stale (running for more than 5 minutes without heartbeat)
-            if bot.worker_started_at:
-                age = timezone.now() - bot.worker_started_at
-                if age > timedelta(minutes=5):
-                    logger.warning(f"Bot {bot.id} worker appears stale (age: {age}), will restart")
+            # Has worker - check if it's stale (no heartbeat for more than 2 minutes)
+            if bot.worker_last_heartbeat:
+                age = timezone.now() - bot.worker_last_heartbeat
+                if age > timedelta(minutes=2):
+                    logger.warning(f"Bot {bot.id} worker appears stale (last heartbeat: {age} ago), will restart")
                     bot.worker_task_id = None
                     bot.worker_started_at = None
+                    bot.worker_last_heartbeat = None
                     bot.save()
 
     # Clean up bots that are no longer RUNNING
-    Bot.objects.exclude(status='RUNNING').update(worker_task_id=None, worker_started_at=None)
+    Bot.objects.exclude(status='RUNNING').update(
+        worker_task_id=None,
+        worker_started_at=None,
+        worker_last_heartbeat=None
+    )
 
     logger.debug(f"Bot monitor: {running_bots.count()} running bots checked")
 
@@ -119,9 +126,11 @@ async def run_bot_worker(bot_id: int, task_id: str = None):
         def claim_bot():
             bot = Bot.objects.get(pk=bot_id)
             if not bot.worker_task_id:
-                task_id_generated = f"bot_{bot.id}_{int(timezone.now().timestamp())}"
+                now = timezone.now()
+                task_id_generated = f"bot_{bot.id}_{int(now.timestamp())}"
                 bot.worker_task_id = task_id_generated
-                bot.worker_started_at = timezone.now()
+                bot.worker_started_at = now
+                bot.worker_last_heartbeat = now  # Initial heartbeat
                 bot.save()
                 return task_id_generated
             return None
@@ -152,6 +161,7 @@ async def run_bot_worker(bot_id: int, task_id: str = None):
                 bot.stopped_at = timezone.now()
                 bot.worker_task_id = None
                 bot.worker_started_at = None
+                bot.worker_last_heartbeat = None
                 bot.save()
 
                 Event.objects.create(
@@ -174,6 +184,7 @@ async def run_bot_worker(bot_id: int, task_id: str = None):
                 if bot.worker_task_id == task_id:
                     bot.worker_task_id = None
                     bot.worker_started_at = None
+                    bot.worker_last_heartbeat = None
                     bot.save()
             except Bot.DoesNotExist:
                 pass

@@ -44,6 +44,9 @@ class BotRunner:
         self.transitioning = False
         self.transition_done = False
 
+        # Heartbeat tracking (for stale worker detection)
+        self.last_heartbeat = 0  # timestamp of last heartbeat
+
         # Note: Signal handlers don't work in worker threads
         # Instead, we poll bot.status in check_bot_status() method
 
@@ -123,14 +126,37 @@ class BotRunner:
                 return datetime.now(timezone.utc)
         return datetime.now(timezone.utc)
 
+    async def send_heartbeat(self):
+        """Send heartbeat to update worker_last_heartbeat timestamp"""
+        import time
+
+        # Only send heartbeat every 30 seconds to reduce DB load
+        now = time.time()
+        if now - self.last_heartbeat < 30:
+            return
+
+        self.last_heartbeat = now
+
+        @sync_to_async
+        def update_heartbeat():
+            from django.utils import timezone
+            self.bot.worker_last_heartbeat = timezone.now()
+            self.bot.save(update_fields=['worker_last_heartbeat'])
+
+        await update_heartbeat()
+
     async def check_bot_status(self):
-        """Check if bot should continue running"""
+        """Check if bot should continue running and send heartbeat"""
         @sync_to_async
         def refresh_bot():
             self.bot.refresh_from_db()
             return self.bot.status
 
         status = await refresh_bot()
+
+        # Send heartbeat while checking status
+        await self.send_heartbeat()
+
         if status != 'RUNNING':
             self.should_stop = True
             print(f"\n[BOT] Stop detected - status changed to {status}")
