@@ -77,6 +77,26 @@ class BotRunner:
         return math.ceil((float(price) - 1e-12) / float(tick)) * float(tick)
 
     @staticmethod
+    def get_exchange_tick_size(price, primary_exchange, base_tick):
+        """
+        Get the correct tick size for a given price and exchange.
+        Some exchanges use variable tick sizes based on price level.
+        """
+        # Euronext exchanges (Paris/SBF, Amsterdam, Brussels, etc.)
+        if primary_exchange in ['SBF', 'AEB', 'EBR']:
+            if price < 50:
+                return 0.01
+            elif price < 100:
+                return 0.05
+            elif price < 500:
+                return 0.10
+            else:
+                return 0.50
+
+        # For other exchanges, use the base tick from IBKR
+        return base_tick
+
+    @staticmethod
     def fmt_ts(exec_time):
         """Format timestamp for logging"""
         if hasattr(exec_time, 'strftime'):
@@ -259,7 +279,16 @@ class BotRunner:
 
             # Place Trailing Stop
             action = 'SELL' if label == "LONG" else 'BUY'
+
+            # Request fresh positions from IBKR
+            await self.ib.reqPositionsAsync()
+            await asyncio.sleep(0.5)  # Give TWS time to send positions
+
             positions = [p for p in self.ib.positions() if p.contract.conId == self.contract.conId and p.account == acc]
+            print(f"[DEBUG] Checking positions for {acc}: found {len(positions)} positions, conId={self.contract.conId}")
+            if positions:
+                print(f"[DEBUG] Position: {positions[0].position} shares")
+
             if not positions or positions[0].position == 0:
                 print(f"No active position found on {acc}. Not placing trailing stop.")
                 return
@@ -347,11 +376,15 @@ class BotRunner:
         def update_fill():
             try:
                 with transaction.atomic():
+                    # Map IBKR side values (BOT/SLD) to our model values (BUY/SELL)
+                    side_map = {'BOT': 'BUY', 'SLD': 'SELL'}
+                    side = side_map.get(exec_obj.side, exec_obj.side)
+
                     execution = Execution.objects.create(
                         order=db_order,
                         cycle=self.cycle,
                         exec_id=exec_id,
-                        side=exec_obj.side,
+                        side=side,
                         shares=Decimal(str(exec_obj.shares)),
                         price=Decimal(str(exec_obj.price)),
                         account=trade.order.account,
@@ -508,6 +541,11 @@ class BotRunner:
 
             details = await self.ib.reqContractDetailsAsync(self.contract)
             min_tick = details[0].minTick if details else 0.01
+            print(f"[CONTRACT] MinTick from IBKR: {min_tick}")
+
+            # Check for price magnifiers (some exchanges use them)
+            if details and hasattr(details[0], 'priceMagnifier'):
+                print(f"[CONTRACT] PriceMagnifier: {details[0].priceMagnifier}")
 
             # Main cycle loop
             while not self.should_stop and await self.check_bot_status():
@@ -848,15 +886,26 @@ class BotRunner:
             l_qty, s_qty = l_filled, s_filled
             l_price, s_price = l_trade.orderStatus.avgFillPrice, s_trade.orderStatus.avgFillPrice
 
+            print(f"[STOP LOSS] Entry prices - Long: {l_price}, Short: {s_price}")
+            print(f"[STOP LOSS] MinTick from IBKR: {min_tick}, Stop %: {self.bot.stop_pct}")
+
+            # Get correct tick size for this price level and exchange
+            actual_tick = self.get_exchange_tick_size(l_price, self.bot.primary_exchange, min_tick)
+            print(f"[STOP LOSS] Actual tick size for price level: {actual_tick}")
+
             # Long Stop Loss (Sell Stop below entry)
-            l_sl_price = self.q_floor(l_price * (1 - float(self.bot.stop_pct) / 100), min_tick)
-            print(f"Placing LONG Stop Loss on {self.bot.long_account} at {l_sl_price:.4f}...")
+            l_sl_price_raw = l_price * (1 - float(self.bot.stop_pct) / 100)
+            l_sl_price = round(l_sl_price_raw / actual_tick) * actual_tick
+            print(f"[STOP LOSS] Long SL: raw={l_sl_price_raw}, rounded={l_sl_price}")
+            print(f"Placing LONG Stop Loss on {self.bot.long_account} at {l_sl_price:.2f}...")
             l_sl_ord = StopOrder('SELL', l_qty, l_sl_price, account=self.bot.long_account,
                                 tif='GTC', outsideRth=True, orderRef=f"C{cycle_number}_LONG_SL")
 
             # Short Stop Loss (Buy Stop above entry)
-            s_sl_price = self.q_ceil(s_price * (1 + float(self.bot.stop_pct) / 100), min_tick)
-            print(f"Placing SHORT Stop Loss on {self.bot.short_account} at {s_sl_price:.4f}...")
+            s_sl_price_raw = s_price * (1 + float(self.bot.stop_pct) / 100)
+            s_sl_price = round(s_sl_price_raw / actual_tick) * actual_tick
+            print(f"[STOP LOSS] Short SL: raw={s_sl_price_raw}, rounded={s_sl_price}")
+            print(f"Placing SHORT Stop Loss on {self.bot.short_account} at {s_sl_price:.2f}...")
             s_sl_ord = StopOrder('BUY', s_qty, s_sl_price, account=self.bot.short_account,
                                 tif='GTC', outsideRth=True, orderRef=f"C{cycle_number}_SHORT_SL")
 
