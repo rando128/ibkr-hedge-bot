@@ -592,6 +592,11 @@ class BotRunner:
             if details and hasattr(details[0], 'priceMagnifier'):
                 print(f"[CONTRACT] PriceMagnifier: {details[0].priceMagnifier}")
 
+            # Pull current positions/orders from TWS so recovery logic has data after restarts
+            await self.ib.reqPositionsAsync()
+            await self.ib.reqOpenOrdersAsync()
+            await asyncio.sleep(0.5)  # Give TWS time to push snapshots
+
             # Main cycle loop
             while not self.should_stop and await self.check_bot_status():
                 self.reset_cycle_state()
