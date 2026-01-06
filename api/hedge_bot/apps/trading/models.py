@@ -56,6 +56,7 @@ class Bot(models.Model):
         help_text="Trading environment (Paper: port 7497, Live: port 7496)"
     )
     use_algo = models.BooleanField(default=False, help_text="Use IBKR Adaptive algo")
+    last_client_id = models.BigIntegerField(null=True, blank=True, help_text="Persisted clientId to reuse across restarts")
 
     @property
     def port(self):

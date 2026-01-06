@@ -168,7 +168,7 @@ class BotRunner:
 
             # Rehydrate positions/orders so callbacks can be reattached
             await self.ib.reqPositionsAsync()
-            await self.ib.reqOpenOrdersAsync()
+            await self.ib.reqAllOpenOrdersAsync()
             await asyncio.sleep(0.5)
             await self.rehydrate_open_trades()
             # On reconnect, backfill any executions that happened while we were down and reconcile DB state
@@ -295,7 +295,7 @@ class BotRunner:
         ]
 
         # First, pull open orders to enrich permIds/status for this cycle
-        await self.ib.reqOpenOrdersAsync()
+        await self.ib.reqAllOpenOrdersAsync()
         await asyncio.sleep(0.5)
         open_orders = [
             o for o in self.ib.openOrders()
@@ -314,8 +314,10 @@ class BotRunner:
                 if getattr(o, 'permId', None) and order.perm_id != o.permId:
                     order.perm_id = o.permId
                     changed = True
-                if order.status in ('PendingSubmit', 'PreSubmitted') and o.orderState.status:
-                    order.status = o.orderState.status
+                order_state = getattr(o, 'orderState', None)
+                state_status = getattr(order_state, 'status', None)
+                if order.status in ('PendingSubmit', 'PreSubmitted') and state_status:
+                    order.status = state_status
                     changed = True
                 if changed:
                     order.save()
@@ -722,6 +724,10 @@ class BotRunner:
         """
         asyncio.create_task(self._handle_exec_details_async(trade, fill))
 
+    def on_order_status(self, trade):
+        """Global order status handler (covers recovery when per-trade callbacks are missing)."""
+        asyncio.create_task(self._handle_order_status_async(trade))
+
     async def _handle_exec_details_async(self, trade, fill):
         exec_obj = fill.execution
         exec_id = getattr(exec_obj, 'execId', None)
@@ -784,6 +790,84 @@ class BotRunner:
                 await self.transition_from_backfill(order_locked, exec_report, exec_time)
         except Exception as e:
             await self.log_event('SYSTEM_ERROR', 'ERROR', f"ExecDetails persist failed {exec_id}: {e}")
+
+    async def _handle_order_status_async(self, trade):
+        order_status = trade.orderStatus if trade else None
+        order_obj = getattr(trade, 'order', None)
+        order_id = getattr(order_status, 'orderId', None) or (order_obj.orderId if order_obj else None)
+        perm_id = getattr(order_status, 'permId', None) or (order_obj.permId if order_obj else None)
+        avg_price = getattr(order_status, 'avgFillPrice', None)
+        filled = getattr(order_status, 'filled', 0) or 0
+        status = getattr(order_status, 'status', None)
+        account = getattr(order_obj, 'account', None) if order_obj else None
+        order_ref = getattr(order_obj, 'orderRef', None) if order_obj else None
+
+        if not order_id and not perm_id and not order_ref:
+            return
+
+        @sync_to_async
+        def find_order():
+            qs = self.cycle.orders.all()
+            if account:
+                qs = qs.filter(account=account)
+            if perm_id:
+                o = qs.filter(perm_id=perm_id).first()
+                if o:
+                    return o
+            if order_ref:
+                o = qs.filter(order_ref=order_ref).first()
+                if o:
+                    return o
+            if order_id is not None:
+                return qs.filter(order_id=order_id).first()
+            return None
+
+        db_order = await find_order()
+        if not db_order:
+            await self.log_event('BACKFILL_MISSING_ORDER', 'WARNING',
+                                 f"OrderStatus for unknown order (orderId={order_id}, permId={perm_id}, ref={order_ref}, acct={account})")
+            return
+
+        @sync_to_async
+        def update_order():
+            changed = False
+            if status and db_order.status != status:
+                db_order.status = status
+                changed = True
+            if db_order.filled_quantity != Decimal(str(filled)):
+                db_order.filled_quantity = Decimal(str(filled))
+                changed = True
+            if avg_price and (db_order.avg_fill_price or Decimal('0')) != Decimal(str(avg_price)):
+                db_order.avg_fill_price = Decimal(str(avg_price))
+                changed = True
+            if perm_id and db_order.perm_id != perm_id:
+                db_order.perm_id = perm_id
+                changed = True
+            if status == 'Filled':
+                db_order.filled_at = datetime.now(timezone.utc)
+            if changed:
+                db_order.save()
+            return changed
+
+        await update_order()
+        self.order_map[db_order.order_id] = db_order
+
+        # Track active protection orders
+        if db_order.role in ('LONG_SL', 'LONG_TRAIL'):
+            self.active_trades['long'] = trade or self.active_trades.get('long')
+        elif db_order.role in ('SHORT_SL', 'SHORT_TRAIL'):
+            self.active_trades['short'] = trade or self.active_trades.get('short')
+
+        # If this is a stop loss filled but we missed execDetails, trigger transition
+        if status == 'Filled' and db_order.role in ('LONG_SL', 'SHORT_SL') and not self.transitioning and not self.transition_done:
+            class _Exec:
+                pass
+            exec_report = _Exec()
+            exec_report.price = avg_price or 0
+            exec_report.avgPrice = avg_price or 0
+            exec_report.acctNumber = account
+            exec_report.side = 'SLD' if db_order.action == 'SELL' else 'BOT'
+            await self.transition_from_backfill(db_order, exec_report, datetime.now(timezone.utc))
 
     def on_trailing_stop_status(self, trade):
         """Handle trailing stop status updates"""
@@ -1111,20 +1195,26 @@ class BotRunner:
                 print(f"[ERROR] Bot status is {self.bot.status}, expected RUNNING")
                 return
 
-            # Connect to IBKR with unique client ID
-            # Formula: (timestamp_ms % 100000) + (bot_id * 100000)
-            # This ensures each bot has a unique ID that changes with every connection attempt
-            # and doesn't conflict even when multiple bots connect simultaneously
-            timestamp_component = int(time.time() * 1000) % 100000  # milliseconds, last 5 digits
-            self.client_id = (self.bot.id * 100000) + timestamp_component
+            # Connect to IBKR with a stable client ID per bot (persisted) to receive updates for existing orders after restart
+            timestamp_component = None
+            if self.bot.last_client_id:
+                self.client_id = self.bot.last_client_id
+            else:
+                timestamp_component = int(time.time() * 1000) % 100000  # milliseconds, last 5 digits
+                self.client_id = (self.bot.id * 100000) + timestamp_component
+                @sync_to_async
+                def persist_client_id(cid):
+                    Bot.objects.filter(pk=self.bot.id).update(last_client_id=cid)
+                await persist_client_id(self.client_id)
             self.port = self.bot.port
 
             self.ib = IB()
             self.ib.errorEvent += self.on_error
             self.ib.commissionReportEvent += self.on_commission_report
             self.ib.execDetailsEvent += self.on_exec_details
+            self.ib.orderStatusEvent += self.on_order_status
 
-            print(f"[CONNECTION] Connecting to TWS with clientId={self.client_id} (bot_id={self.bot.id}, timestamp={timestamp_component})")
+            print(f"[CONNECTION] Connecting to TWS with clientId={self.client_id} (bot_id={self.bot.id}, timestamp={timestamp_component or 'reuse'})")
             await self.ib.connectAsync(self.host, self.port, clientId=self.client_id)
             await self.log_event('BOT_START', 'INFO', f"Bot started: {self.bot.symbol} (clientId={self.client_id})")
 
@@ -1153,7 +1243,7 @@ class BotRunner:
 
             # Pull current positions/orders from TWS so recovery logic has data after restarts
             await self.ib.reqPositionsAsync()
-            await self.ib.reqOpenOrdersAsync()
+            await self.ib.reqAllOpenOrdersAsync()
             await asyncio.sleep(0.5)  # Give TWS time to push snapshots
 
             # Main cycle loop
@@ -1185,8 +1275,8 @@ class BotRunner:
 
                     open_orders = [o for o in self.ib.openOrders()
                                    if o.account in [self.bot.long_account, self.bot.short_account]]
-                    # Refresh open orders snapshot to catch pending orders immediately after restart
-                    await self.ib.reqOpenOrdersAsync()
+                    # Refresh open orders snapshot (all accounts) to catch pending orders immediately after restart
+                    await self.ib.reqAllOpenOrdersAsync()
                     await asyncio.sleep(0.5)
                     open_orders = [o for o in self.ib.openOrders()
                                    if o.account in [self.bot.long_account, self.bot.short_account]]
@@ -1229,8 +1319,8 @@ class BotRunner:
                     await self.backfill_executions()
                     await self.reconcile_cycle_state()
 
-                    # Refresh open orders/trades after backfill
-                    await self.ib.reqOpenOrdersAsync()
+                    # Refresh open orders/trades after backfill (all accounts)
+                    await self.ib.reqAllOpenOrdersAsync()
                     await asyncio.sleep(0.5)
                     open_trades = [t for t in self.ib.openTrades()
                                    if t.contract.conId == self.contract.conId
@@ -1288,6 +1378,7 @@ class BotRunner:
 
                     # Continue monitoring this cycle
                     print(f"[RECOVERY] Monitoring recovered cycle {existing_cycle.cycle_number}...")
+                    last_exec_poll = time.time()
 
                     # Monitor positions until flat (same as normal cycle monitoring)
                     while True:
@@ -1298,6 +1389,12 @@ class BotRunner:
 
                         await asyncio.sleep(2)
                         self.ib.waitOnUpdate()
+
+                        # Poll executions during recovered monitoring since live execEvents may not arrive for legacy orders
+                        if time.time() - last_exec_poll > 5:
+                            await self.backfill_executions()
+                            await self.reconcile_cycle_state()
+                            last_exec_poll = time.time()
 
                         # Check if all positions are flat
                         pos = [p for p in self.ib.positions()
