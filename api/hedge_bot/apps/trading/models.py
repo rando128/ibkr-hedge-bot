@@ -65,6 +65,12 @@ class Bot(models.Model):
     # Status
     status = models.CharField(max_length=20, choices=STATUS_CHOICES, default='IDLE', db_index=True)
 
+    # Worker tracking (for multi-worker coordination)
+    worker_task_id = models.CharField(max_length=255, null=True, blank=True,
+                                     help_text="Procrastinate task ID of the running worker (for multi-worker deduplication)")
+    worker_started_at = models.DateTimeField(null=True, blank=True,
+                                            help_text="When the current worker task started")
+
     # Timestamps
     created_at = models.DateTimeField(auto_now_add=True)
     updated_at = models.DateTimeField(auto_now=True)

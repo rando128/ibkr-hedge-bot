@@ -39,7 +39,8 @@ class BotRunner:
         self.cycle: Optional[Cycle] = None
         self.active_trades = {'long': None, 'short': None}
         self.order_map = {}  # Maps IBKR orderId -> Django Order instance
-        self.exec_ids_seen = set()
+        self.exec_ids_seen = set()  # Track fills to avoid duplicates
+        self.commission_ids_seen = set()  # Track commission reports separately
         self.transitioning = False
         self.transition_done = False
 
@@ -143,6 +144,7 @@ class BotRunner:
         self.active_trades = {'long': None, 'short': None}
         self.order_map.clear()
         self.exec_ids_seen.clear()
+        self.commission_ids_seen.clear()  # Reset commission tracking too
         self.transitioning = False
         self.transition_done = False
 
@@ -159,8 +161,11 @@ class BotRunner:
     def on_commission_report(self, trade, fill, report):
         """Handle commission reports"""
         exec_id = getattr(report, 'execId', None) or fill.execution.execId
-        if exec_id in self.exec_ids_seen:
+
+        # Use separate tracking set for commissions
+        if exec_id in self.commission_ids_seen:
             return
+        self.commission_ids_seen.add(exec_id)
 
         # Schedule async handling (can't do sync DB operations in callback)
         asyncio.create_task(self._handle_commission_async(exec_id, report, fill))
@@ -614,9 +619,75 @@ class BotRunner:
                                            f"Auto-completed orphan cycle {existing_cycle.cycle_number}")
                         continue  # Now try creating a new cycle
 
-                    print(f"\n[CYCLE CHECK] Waiting 10 seconds for cycle {existing_cycle.cycle_number} to complete...")
-                    await asyncio.sleep(10)
-                    continue  # Skip to next iteration, wait for cycle to complete
+                    # RECOVERY: Re-attach to existing cycle and restore state
+                    print(f"\n[RECOVERY] Attempting to recover cycle {existing_cycle.cycle_number}...")
+                    self.cycle = existing_cycle
+
+                    # Load existing orders from database and map to open trades
+                    @sync_to_async
+                    def load_cycle_orders():
+                        return list(existing_cycle.orders.filter(
+                            status__in=['PreSubmitted', 'Submitted', 'Filled']
+                        ).select_related('cycle'))
+
+                    db_orders = await load_cycle_orders()
+
+                    # Match DB orders with IBKR open orders and re-register callbacks
+                    for db_order in db_orders:
+                        matching_trade = next((t for t in open_orders if t.order.orderId == db_order.order_id), None)
+                        if matching_trade:
+                            print(f"[RECOVERY] Re-registering callbacks for {db_order.role} (order {db_order.order_id})")
+                            self.order_map[db_order.order_id] = db_order
+
+                            # Re-register fill callbacks
+                            matching_trade.fillEvent += self.on_fill
+
+                            # Store active stop loss trades for monitoring
+                            if db_order.role == 'LONG_SL':
+                                self.active_trades['long'] = matching_trade
+                            elif db_order.role == 'SHORT_SL':
+                                self.active_trades['short'] = matching_trade
+
+                    await self.log_event('CYCLE_RECOVERED', 'INFO',
+                                       f"Recovered cycle {existing_cycle.cycle_number}, monitoring {len(self.order_map)} orders")
+
+                    # Continue monitoring this cycle
+                    print(f"[RECOVERY] Monitoring recovered cycle {existing_cycle.cycle_number}...")
+
+                    # Monitor positions until flat (same as normal cycle monitoring)
+                    while True:
+                        if not await self.check_bot_status():
+                            await self.log_event('CYCLE_ABORTED', 'WARNING', "Bot stop detected during monitoring")
+                            await self._panic_flatten()
+                            break
+
+                        await asyncio.sleep(2)
+                        self.ib.waitOnUpdate()
+
+                        # Check if all positions are flat
+                        pos = [p for p in self.ib.positions()
+                              if p.contract.conId == self.contract.conId
+                              and p.account in [self.bot.long_account, self.bot.short_account]]
+
+                        if not pos or all(p.position == 0 for p in pos):
+                            print("\n>>> ALL POSITIONS CLOSED (recovered cycle).")
+                            break
+
+                    # Cleanup and complete cycle
+                    await self._cleanup_orphan_orders()
+
+                    @sync_to_async
+                    def finalize_recovered_cycle():
+                        self.cycle.status = 'COMPLETED'
+                        self.cycle.completed_at = datetime.now(timezone.utc)
+                        self.cycle.save()
+
+                    await finalize_recovered_cycle()
+                    await self.report_pnl(is_final=True)
+                    await self.log_event('CYCLE_COMPLETE', 'INFO',
+                                       f"Recovered cycle {existing_cycle.cycle_number} completed with P&L: {self.cycle.net_pnl:.2f}")
+
+                    continue  # Start next cycle
 
                 # PREFLIGHT CHECK: Verify no existing positions or orders before starting new cycle
                 print("\n[PREFLIGHT] Checking for existing positions and orders...")
@@ -688,10 +759,10 @@ class BotRunner:
 
                 if not success:
                     print("[CYCLE] Cycle failed - setting bot to ERROR status")
-                    # Mark cycle as failed
+                    # Mark cycle and bot as ERROR
                     @sync_to_async
                     def mark_failed_and_stop():
-                        self.cycle.status = 'FAILED'
+                        self.cycle.status = 'ERROR'
                         self.cycle.completed_at = datetime.now(timezone.utc)
                         self.cycle.save()
 
@@ -743,9 +814,9 @@ class BotRunner:
                 @sync_to_async
                 def update_final_status():
                     self.bot.refresh_from_db()
-                    # Only mark as stopped if it's not already in RUNNING state
-                    # (i.e., if it was explicitly stopped by user)
-                    if self.bot.status != 'RUNNING':
+                    # Only mark as stopped if status is not RUNNING and not ERROR
+                    # Preserve ERROR status to help with debugging
+                    if self.bot.status not in ('RUNNING', 'ERROR'):
                         self.bot.status = 'STOPPED'
                         self.bot.stopped_at = datetime.now(timezone.utc)
                         self.bot.save()
@@ -1010,42 +1081,6 @@ class BotRunner:
             await self.log_event('CYCLE_ERROR', 'ERROR', f"Cycle execution error: {str(e)}")
             await self._panic_flatten()
             return False
-
-    async def _panic_flatten(self):
-        """Flatten all positions for this contract/bot in case of errors"""
-        print("\n[PANIC] Flattening all positions...")
-        await self.log_event('PANIC_FLATTEN', 'WARNING', "Flattening all positions due to error")
-
-        for acc in [self.bot.long_account, self.bot.short_account]:
-            pos = [p for p in self.ib.positions()
-                  if p.contract.conId == self.contract.conId and p.account == acc]
-            if pos and pos[0].position != 0:
-                qty = abs(pos[0].position)
-                action = 'SELL' if pos[0].position > 0 else 'BUY'
-                print(f"[PANIC] Flattening {acc}: {action} {qty} shares...")
-                from ib_insync import MarketOrder
-                self.ib.placeOrder(self.contract, MarketOrder(action, qty, account=acc))
-
-        # Cleanup orphan orders
-        await self._cleanup_orphan_orders()
-
-    async def _cleanup_orphan_orders(self):
-        """Cancel any open orders for this contract/bot"""
-        print("[CLEANUP] Cleaning up orphan orders...")
-        orphans = []
-        for t in self.ib.openTrades():
-            if (t.contract.conId == self.contract.conId and
-                t.order.account in [self.bot.long_account, self.bot.short_account]):
-                print(f"[CLEANUP] Cancelling {t.order.orderType} order {t.order.orderId} on {t.order.account}")
-                self.ib.cancelOrder(t.order)
-                orphans.append(t)
-
-        if orphans:
-            print(f"[CLEANUP] Waiting for {len(orphans)} cancellations...")
-            deadline = asyncio.get_event_loop().time() + 10
-            while any(not t.isDone() for t in orphans) and asyncio.get_event_loop().time() < deadline:
-                await asyncio.sleep(0.5)
-                self.ib.waitOnUpdate()
 
     async def _panic_flatten(self):
         """Flatten all positions for this contract/bot in case of errors"""
