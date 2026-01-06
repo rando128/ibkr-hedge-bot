@@ -311,25 +311,52 @@ class BotRunner:
                 continue
 
             for rpt in reports:
-                exec_id = rpt.execId
+                # reqExecutionsAsync may yield Execution or Fill; normalize fields
+                exec_obj = getattr(rpt, 'execution', rpt)
+                exec_id = getattr(exec_obj, 'execId', None)
+                perm_id = getattr(exec_obj, 'permId', None)
+                order_id = getattr(exec_obj, 'orderId', None)
+                account = getattr(exec_obj, 'acctNumber', None)
+                side = getattr(exec_obj, 'side', None)
+                shares = getattr(exec_obj, 'shares', None)
+                price = getattr(exec_obj, 'price', None)
+                avg_price = getattr(exec_obj, 'avgPrice', None)
+                exec_time_raw = getattr(exec_obj, 'time', None)
+
+                if not exec_id:
+                    await self.log_event('EXECUTION_BACKFILL_MISSING_ID', 'WARNING', f"Skipping execution without execId (orderId={order_id}, account={account})")
+                    continue
 
                 # Skip duplicates already seen/recorded
                 if exec_id in self.exec_ids_seen or await execution_exists(exec_id):
                     self.exec_ids_seen.add(exec_id)
                     continue
 
-                order = await find_order(getattr(rpt, 'permId', None), getattr(rpt, 'orderId', None), getattr(rpt, 'acctNumber', None))
+                order = await find_order(perm_id, order_id, account)
                 if not order:
                     await self.log_event(
                         'EXECUTION_BACKFILL_MISSING_ORDER',
                         'WARNING',
-                        f"Execution {exec_id} has no matching order (permId={getattr(rpt, 'permId', None)}, orderId={getattr(rpt, 'orderId', None)}, account={getattr(rpt, 'acctNumber', None)})"
+                        f"Execution {exec_id} has no matching order (permId={perm_id}, orderId={order_id}, account={account})"
                     )
                     continue
 
-                exec_time = self.get_safe_timestamp(getattr(rpt, 'time', None))
+                # Rebuild a lightweight exec_report-like object for persist_execution
+                class _Exec:
+                    pass
+                exec_report = _Exec()
+                exec_report.execId = exec_id
+                exec_report.permId = perm_id
+                exec_report.orderId = order_id
+                exec_report.acctNumber = account
+                exec_report.side = side
+                exec_report.shares = shares
+                exec_report.price = price
+                exec_report.avgPrice = avg_price
+
+                exec_time = self.get_safe_timestamp(exec_time_raw)
                 try:
-                    order_locked, cycle_locked = await persist_execution(order, rpt, exec_time)
+                    order_locked, cycle_locked = await persist_execution(order, exec_report, exec_time)
                     self.order_map[order_locked.order_id] = order_locked
                     self.cycle = cycle_locked
                     self.exec_ids_seen.add(exec_id)
