@@ -170,32 +170,34 @@ class BotRunner:
         from asgiref.sync import sync_to_async
 
         try:
-            # Skip if no active cycle
-            if not self.cycle:
-                print(f"[WARNING] Commission report received but no active cycle for exec_id {exec_id}")
-                return
-
             @sync_to_async
             def update_commission():
-                execution = Execution.objects.get(exec_id=exec_id)
-                execution.commission = Decimal(str(report.commission))
-                execution.commission_currency = report.currency or 'USD'
-                execution.save()
+                try:
+                    execution = Execution.objects.get(exec_id=exec_id)
+                    execution.commission = Decimal(str(report.commission))
+                    execution.commission_currency = report.currency or 'USD'
+                    execution.save()
 
-                # Update cycle P&L
-                with transaction.atomic():
-                    cycle = Cycle.objects.select_for_update().get(pk=self.cycle.pk)
-                    cycle.total_commission += Decimal(str(report.commission))
-                    cycle.net_pnl = cycle.total_sells - cycle.total_buys - cycle.total_commission
-                    cycle.save()
-                    self.cycle = cycle
+                    # Update cycle P&L (lookup from execution, works even after cycle completes)
+                    with transaction.atomic():
+                        cycle = Cycle.objects.select_for_update().get(pk=execution.cycle_id)
+                        cycle.total_commission += Decimal(str(report.commission))
+                        cycle.net_pnl = cycle.total_sells - cycle.total_buys - cycle.total_commission
+                        cycle.save()
 
-            await update_commission()
+                        # Update self.cycle only if it's still the current cycle
+                        if self.cycle and self.cycle.pk == cycle.pk:
+                            self.cycle = cycle
 
-            exec_time = self.get_safe_timestamp(fill.execution.time)
-            print(f"[{self.fmt_ts(exec_time)}] [COMMISSION]: {report.commission:.2f} {report.currency}")
-        except Execution.DoesNotExist:
-            pass
+                    return True
+                except Execution.DoesNotExist:
+                    return False
+
+            result = await update_commission()
+
+            if result:
+                exec_time = self.get_safe_timestamp(fill.execution.time)
+                print(f"[{self.fmt_ts(exec_time)}] [COMMISSION]: {report.commission:.2f} {report.currency}")
         except Exception as e:
             print(f"[ERROR] Commission report handling failed: {e}")
 
