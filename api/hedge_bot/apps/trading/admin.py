@@ -549,7 +549,7 @@ class OrderAdmin(admin.ModelAdmin):
 
 @admin.register(Execution)
 class ExecutionAdmin(admin.ModelAdmin):
-    list_display = ['exec_id', 'order', 'side', 'shares', 'price', 'commission', 'executed_at']
+    list_display = ['exec_id', 'order', 'side', 'shares', 'price', 'commission', 'created_at']
     list_filter = ['side']
     search_fields = ['exec_id', 'account']
     readonly_fields = ['created_at', 'executed_at']

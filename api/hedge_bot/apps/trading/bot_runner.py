@@ -218,6 +218,54 @@ class BotRunner:
             elif db_order.role in ('SHORT_SL', 'SHORT_TRAIL'):
                 self.active_trades['short'] = t
 
+    async def _persist_exec_common(self, order, exec_report, exec_time):
+        """
+        Persist an execution and update order/cycle P&L. Shared by backfill and execDetails handler.
+        """
+        side_map = {'BOT': 'BUY', 'SLD': 'SELL'}
+        side = side_map.get(exec_report.side, exec_report.side)
+        shares = Decimal(str(exec_report.shares))
+        price = Decimal(str(exec_report.price))
+        avg_price = Decimal(str(exec_report.avgPrice or exec_report.price or 0))
+
+        @sync_to_async
+        def persist():
+            with transaction.atomic():
+                order_locked = Order.objects.select_for_update().get(pk=order.pk)
+                cycle_locked = Cycle.objects.select_for_update().get(pk=order_locked.cycle_id)
+
+                Execution.objects.create(
+                    order=order_locked,
+                    cycle=cycle_locked,
+                    exec_id=exec_report.execId,
+                    side=side,
+                    shares=shares,
+                    price=price,
+                    account=exec_report.acctNumber,
+                    executed_at=exec_time
+                )
+
+                order_locked.filled_quantity += shares
+                order_locked.status = 'Filled' if order_locked.filled_quantity >= order_locked.total_quantity else 'PartiallyFilled'
+                order_locked.avg_fill_price = avg_price
+                if getattr(exec_report, 'permId', None):
+                    order_locked.perm_id = getattr(exec_report, 'permId')
+                if order_locked.status == 'Filled':
+                    order_locked.filled_at = exec_time
+                order_locked.save()
+
+                if side == 'BUY':
+                    cycle_locked.total_buys += shares * price
+                else:
+                    cycle_locked.total_sells += shares * price
+
+                cycle_locked.net_pnl = cycle_locked.total_sells - cycle_locked.total_buys - cycle_locked.total_commission
+                cycle_locked.save()
+
+                return order_locked, cycle_locked
+
+        return await persist()
+
     async def backfill_executions(self):
         """
         Pull recent executions from IBKR and reconcile any fills that happened while the worker was down.
@@ -299,49 +347,6 @@ class BotRunner:
             # Fallback to order_id
             return qs.filter(order_id=order_id).first()
 
-        @sync_to_async
-        def persist_execution(order, exec_report, exec_time):
-            side_map = {'BOT': 'BUY', 'SLD': 'SELL'}
-            side = side_map.get(exec_report.side, exec_report.side)
-            shares = Decimal(str(exec_report.shares))
-            price = Decimal(str(exec_report.price))
-            avg_price = Decimal(str(exec_report.avgPrice or exec_report.price or 0))
-
-            with transaction.atomic():
-                # Lock related rows to keep totals consistent
-                order_locked = Order.objects.select_for_update().get(pk=order.pk)
-                cycle_locked = Cycle.objects.select_for_update().get(pk=order_locked.cycle_id)
-
-                Execution.objects.create(
-                    order=order_locked,
-                    cycle=cycle_locked,
-                    exec_id=exec_report.execId,
-                    side=side,
-                    shares=shares,
-                    price=price,
-                    account=exec_report.acctNumber,
-                    executed_at=exec_time
-                )
-
-                order_locked.filled_quantity += shares
-                order_locked.status = 'Filled' if order_locked.filled_quantity >= order_locked.total_quantity else 'PartiallyFilled'
-                order_locked.avg_fill_price = avg_price
-                if getattr(exec_report, 'permId', None):
-                    order_locked.perm_id = getattr(exec_report, 'permId')
-                if order_locked.status == 'Filled':
-                    order_locked.filled_at = exec_time
-                order_locked.save()
-
-                if side == 'BUY':
-                    cycle_locked.total_buys += shares * price
-                else:
-                    cycle_locked.total_sells += shares * price
-
-                cycle_locked.net_pnl = cycle_locked.total_sells - cycle_locked.total_buys - cycle_locked.total_commission
-                cycle_locked.save()
-
-                return order_locked, cycle_locked
-
         for flt in filters:
             try:
                 reports = await self.ib.reqExecutionsAsync(flt)
@@ -397,10 +402,13 @@ class BotRunner:
 
                 exec_time = self.get_safe_timestamp(exec_time_raw)
                 try:
-                    order_locked, cycle_locked = await persist_execution(order, exec_report, exec_time)
+                    order_locked, cycle_locked = await self._persist_exec_common(order, exec_report, exec_time)
                     self.order_map[order_locked.order_id] = order_locked
                     self.cycle = cycle_locked
                     self.exec_ids_seen.add(exec_id)
+                    # If this was a stop loss fill detected via backfill, kick off trailing transition
+                    if order_locked.role in ('LONG_SL', 'SHORT_SL'):
+                        await self.transition_from_backfill(order_locked, exec_report, exec_time)
                     new_execs += 1
                 except Exception as e:
                     await self.log_event('SYSTEM_ERROR', 'ERROR', f"Failed to persist backfilled execution {exec_id}: {e}")
@@ -409,6 +417,114 @@ class BotRunner:
             await self.log_event('BACKFILL_APPLIED', 'INFO', f"Backfilled {new_execs} executions from IBKR")
 
         return new_execs
+
+    async def transition_from_backfill(self, order, exec_report, exec_time):
+        """
+        Handle stop-loss transition when the fill was detected via backfill (worker was down).
+        """
+        if self.transitioning or self.transition_done:
+            return
+        self.transitioning = True
+        transitioned = False
+
+        try:
+            await self.log_event('STOP_LOSS_HIT', 'WARNING', f"Stop loss (backfill) on {order.account}")
+
+            @sync_to_async
+            def mark_transitioning():
+                self.cycle.status = 'TRANSITIONING'
+                self.cycle.save()
+            await mark_transitioning()
+
+            hit_leg = 'long' if order.account == self.bot.long_account else 'short'
+            surviving_leg = 'short' if hit_leg == 'long' else 'long'
+            surviving_acc = self.bot.long_account if surviving_leg == 'long' else self.bot.short_account
+
+            # Cancel surviving stop if still open
+            surviving_trade = None
+            for t in self.ib.openTrades():
+                if (t.contract.conId == self.contract.conId and
+                        t.order.account == surviving_acc and
+                        t.order.orderType in ('STP', 'STP LMT') and
+                        t.orderStatus.status in ('PreSubmitted', 'Submitted')):
+                    surviving_trade = t
+                    break
+
+            if surviving_trade:
+                self.ib.cancelOrder(surviving_trade.order)
+                deadline = asyncio.get_event_loop().time() + 10
+                while not surviving_trade.isDone() and asyncio.get_event_loop().time() < deadline:
+                    await asyncio.sleep(0.1)
+                    self.ib.waitOnUpdate()
+
+                st = surviving_trade.orderStatus.status
+                if st not in ('Cancelled', 'ApiCancelled'):
+                    # Already filled or not cancellable; abort trailing placement
+                    await self.log_event('ORDER_CANCELLED', 'INFO',
+                                         f"Surviving stop not cancelled (status={st}), skipping trailing")
+                    return
+
+            # Place trailing on surviving position
+            await self.ib.reqPositionsAsync()
+            await asyncio.sleep(0.5)
+            pos = [p for p in self.ib.positions()
+                   if p.contract.conId == self.contract.conId and p.account == surviving_acc and p.position != 0]
+            if not pos:
+                await self.log_event('TRANSITION_COMPLETE', 'INFO', f"No position on {surviving_acc}, nothing to trail")
+                return
+
+            qty = abs(pos[0].position)
+            market_price = Decimal(str(exec_report.price or exec_report.avgPrice or 0))
+            tick = float(self.cycle.min_tick)
+
+            label = surviving_leg.upper()
+            action = 'SELL' if label == 'LONG' else 'BUY'
+            if label == 'LONG':
+                trail_price = self.q_floor(float(market_price) * (1 - (float(self.bot.trailing_pct) / 100)), tick)
+            else:
+                trail_price = self.q_ceil(float(market_price) * (1 + (float(self.bot.trailing_pct) / 100)), tick)
+
+            from ib_insync import Order as IBOrder
+            trail_order = IBOrder(
+                action=action, totalQuantity=qty, orderType='TRAIL',
+                trailingPercent=float(self.bot.trailing_pct), account=surviving_acc, tif='GTC', outsideRth=True,
+                orderRef=f"C{self.cycle.cycle_number}_{label}_TRAIL"
+            )
+            t_trade = self.ib.placeOrder(self.contract, trail_order)
+            t_trade.fillEvent += self.on_fill
+            t_trade.statusEvent += self.on_trailing_stop_status
+            self.active_trades[surviving_leg] = t_trade
+
+            @sync_to_async
+            def create_trail_order():
+                return Order.objects.create(
+                    cycle=self.cycle,
+                    order_id=t_trade.order.orderId,
+                    order_ref=trail_order.orderRef,
+                    role=f"{label}_TRAIL",
+                    account=surviving_acc,
+                    action=action,
+                    order_type='TRAIL',
+                    total_quantity=Decimal(str(qty)),
+                    trailing_percent=self.bot.trailing_pct,
+                    status='PendingSubmit'
+                )
+
+            db_order = await create_trail_order()
+            self.order_map[t_trade.order.orderId] = db_order
+            await self.log_event('TRANSITION_COMPLETE', 'INFO', f"Placed {label} trailing stop (backfill)", order=db_order)
+
+            transitioned = True
+        finally:
+            if transitioned:
+                self.transition_done = True
+
+                @sync_to_async
+                def update_cycle_status():
+                    self.cycle.status = 'ACTIVE'
+                    self.cycle.save()
+                await update_cycle_status()
+            self.transitioning = False
 
     async def reconcile_cycle_state(self):
         """
@@ -483,9 +599,9 @@ class BotRunner:
             if order.status in pending_statuses:
                 last_exec = max(order.executions.all(), key=lambda e: e.executed_at) if order.executions.exists() else None
                 new_status = None
-                if order.filled_quantity >= order.total_quantity and order.total_quantity > 0:
+                if order.filled_quantity >= order.total_quantity and order.total_quantity > 0 and last_exec:
                     new_status = 'Filled'
-                elif order.filled_quantity > 0:
+                elif order.filled_quantity > 0 and last_exec:
                     new_status = 'PartiallyFilled'
 
                 if new_status:
@@ -601,6 +717,75 @@ class BotRunner:
                 print(f"[{self.fmt_ts(exec_time)}] [COMMISSION]: {report.commission:.2f} {report.currency}")
         except Exception as e:
             print(f"[ERROR] Commission report handling failed: {e}")
+
+    def on_exec_details(self, trade, fill):
+        """
+        Capture executions even when we don't have a Trade object (e.g., after restart).
+        """
+        asyncio.create_task(self._handle_exec_details_async(trade, fill))
+
+    async def _handle_exec_details_async(self, trade, fill):
+        exec_obj = fill.execution
+        exec_id = getattr(exec_obj, 'execId', None)
+        if not exec_id:
+            return
+        if exec_id in self.exec_ids_seen:
+            return
+        self.exec_ids_seen.add(exec_id)
+
+        order = None
+        if trade and trade.order.orderId in self.order_map:
+            order = self.order_map[trade.order.orderId]
+        if not order:
+            @sync_to_async
+            def find_order():
+                qs = self.cycle.orders.filter(account=getattr(exec_obj, 'acctNumber', None))
+                perm_id = getattr(exec_obj, 'permId', None)
+                order_ref = getattr(exec_obj, 'orderRef', None)
+                order_id = getattr(exec_obj, 'orderId', None)
+                if perm_id:
+                    o = qs.filter(perm_id=perm_id).first()
+                    if o:
+                        return o
+                if order_ref:
+                    o = qs.filter(order_ref=order_ref).first()
+                    if o:
+                        return o
+                if order_id:
+                    return qs.filter(order_id=order_id).first()
+                return None
+
+            order = await find_order()
+
+        if not order:
+            await self.log_event('BACKFILL_MISSING_ORDER', 'WARNING',
+                                 f"ExecDetails {exec_id} missing order (orderId={getattr(exec_obj, 'orderId', None)}, permId={getattr(exec_obj, 'permId', None)}, ref={getattr(exec_obj, 'orderRef', None)})")
+            return
+
+        # Build a lightweight report object to reuse backfill persistence logic
+        class _Exec:
+            pass
+        exec_report = _Exec()
+        exec_report.execId = exec_id
+        exec_report.permId = getattr(exec_obj, 'permId', None)
+        exec_report.orderId = getattr(exec_obj, 'orderId', None)
+        exec_report.acctNumber = getattr(exec_obj, 'acctNumber', None)
+        exec_report.side = getattr(exec_obj, 'side', None)
+        exec_report.shares = getattr(exec_obj, 'shares', None)
+        exec_report.price = getattr(exec_obj, 'price', None)
+        exec_report.avgPrice = getattr(exec_obj, 'avgPrice', None)
+        exec_report.orderRef = getattr(exec_obj, 'orderRef', None)
+
+        exec_time = self.get_safe_timestamp(getattr(exec_obj, 'time', None))
+
+        try:
+            order_locked, cycle_locked = await self._persist_exec_common(order, exec_report, exec_time)
+            self.order_map[order_locked.order_id] = order_locked
+            self.cycle = cycle_locked
+            if order_locked.role in ('LONG_SL', 'SHORT_SL'):
+                await self.transition_from_backfill(order_locked, exec_report, exec_time)
+        except Exception as e:
+            await self.log_event('SYSTEM_ERROR', 'ERROR', f"ExecDetails persist failed {exec_id}: {e}")
 
     def on_trailing_stop_status(self, trade):
         """Handle trailing stop status updates"""
@@ -939,6 +1124,7 @@ class BotRunner:
             self.ib = IB()
             self.ib.errorEvent += self.on_error
             self.ib.commissionReportEvent += self.on_commission_report
+            self.ib.execDetailsEvent += self.on_exec_details
 
             print(f"[CONNECTION] Connecting to TWS with clientId={self.client_id} (bot_id={self.bot.id}, timestamp={timestamp_component})")
             await self.ib.connectAsync(self.host, self.port, clientId=self.client_id)
@@ -1047,6 +1233,24 @@ class BotRunner:
                     await self.backfill_executions()
                     await self.reconcile_cycle_state()
 
+                    # Refresh open orders/trades after backfill
+                    await self.ib.reqOpenOrdersAsync()
+                    await asyncio.sleep(0.5)
+                    open_trades = [t for t in self.ib.openTrades()
+                                   if t.contract.conId == self.contract.conId
+                                   and t.order.account in [self.bot.long_account, self.bot.short_account]]
+                    open_orders = [o for o in self.ib.openOrders()
+                                   if o.contract.conId == self.contract.conId
+                                   and o.account in [self.bot.long_account, self.bot.short_account]]
+
+                    # Build lookup helpers for matching even if orderIds changed or only permId/orderRef is available
+                    trade_by_order_id = {t.order.orderId: t for t in open_trades}
+                    trade_by_perm_id = {getattr(t.order, 'permId', None): t for t in open_trades if getattr(t.order, 'permId', None)}
+                    trade_by_ref = {getattr(t.order, 'orderRef', None): t for t in open_trades if getattr(t.order, 'orderRef', None)}
+                    order_by_order_id = {o.orderId: o for o in open_orders}
+                    order_by_perm_id = {getattr(o, 'permId', None): o for o in open_orders if getattr(o, 'permId', None)}
+                    order_by_ref = {getattr(o, 'orderRef', None): o for o in open_orders if getattr(o, 'orderRef', None)}
+
                     # Load existing orders from database and map to open trades
                     @sync_to_async
                     def load_cycle_orders():
@@ -1058,8 +1262,16 @@ class BotRunner:
 
                     # Match DB orders with IBKR open trades/orders and re-register callbacks
                     for db_order in db_orders:
-                        matching_trade = next((t for t in open_trades if t.order.orderId == db_order.order_id), None)
-                        matching_order = next((o for o in open_orders if o.orderId == db_order.order_id), None)
+                        matching_trade = (
+                            trade_by_order_id.get(db_order.order_id)
+                            or trade_by_perm_id.get(db_order.perm_id)
+                            or trade_by_ref.get(db_order.order_ref)
+                        )
+                        matching_order = (
+                            order_by_order_id.get(db_order.order_id)
+                            or order_by_perm_id.get(db_order.perm_id)
+                            or order_by_ref.get(db_order.order_ref)
+                        )
                         if matching_trade:
                             print(f"[RECOVERY] Re-registering callbacks for {db_order.role} (order {db_order.order_id})")
                             self.order_map[db_order.order_id] = db_order
