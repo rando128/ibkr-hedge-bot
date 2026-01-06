@@ -246,6 +246,37 @@ class BotRunner:
             for acc in accounts
         ]
 
+        # First, pull open orders to enrich permIds/status for this cycle
+        await self.ib.reqOpenOrdersAsync()
+        await asyncio.sleep(0.5)
+        open_orders = [
+            o for o in self.ib.openOrders()
+            if o.contract.conId == self.contract.conId
+            and o.account in accounts
+        ]
+
+        @sync_to_async
+        def sync_perm_ids():
+            updated = 0
+            for o in open_orders:
+                try:
+                    order = self.cycle.orders.get(order_id=o.orderId, account=o.account)
+                except Order.DoesNotExist:
+                    continue
+                changed = False
+                if getattr(o, 'permId', None) and order.perm_id != o.permId:
+                    order.perm_id = o.permId
+                    changed = True
+                if order.status in ('PendingSubmit', 'PreSubmitted') and o.orderState.status:
+                    order.status = o.orderState.status
+                    changed = True
+                if changed:
+                    order.save()
+                    updated += 1
+            return updated
+
+        await sync_perm_ids()
+
         new_execs = 0
 
         @sync_to_async
@@ -253,12 +284,19 @@ class BotRunner:
             return Execution.objects.filter(exec_id=exec_id).exists()
 
         @sync_to_async
-        def find_order(perm_id, order_id, account):
+        def find_order(perm_id, order_id, account, order_ref):
             qs = self.cycle.orders.filter(account=account)
+            # Prefer permId
             if perm_id:
                 order = qs.filter(perm_id=perm_id).first()
                 if order:
                     return order
+            # OrderRef carries cycle number (e.g., C{cycle}_LONG_SL)
+            if order_ref:
+                order = qs.filter(order_ref=order_ref).first()
+                if order:
+                    return order
+            # Fallback to order_id
             return qs.filter(order_id=order_id).first()
 
         @sync_to_async
@@ -323,6 +361,7 @@ class BotRunner:
                 price = getattr(exec_obj, 'price', None)
                 avg_price = getattr(exec_obj, 'avgPrice', None)
                 exec_time_raw = getattr(exec_obj, 'time', None)
+                order_ref = getattr(exec_obj, 'orderRef', None)
 
                 if not exec_id:
                     await self.log_event('BACKFILL_SKIP_NO_ID', 'WARNING', f"Skipping execution without execId (orderId={order_id}, account={account})")
@@ -333,12 +372,12 @@ class BotRunner:
                     self.exec_ids_seen.add(exec_id)
                     continue
 
-                order = await find_order(perm_id, order_id, account)
+                order = await find_order(perm_id, order_id, account, order_ref)
                 if not order:
                     await self.log_event(
                         'BACKFILL_MISSING_ORDER',
                         'WARNING',
-                        f"Execution {exec_id} has no matching order (permId={perm_id}, orderId={order_id}, account={account})"
+                        f"Execution {exec_id} has no matching order (permId={perm_id}, orderId={order_id}, account={account}, orderRef={order_ref})"
                     )
                     continue
 
@@ -354,6 +393,7 @@ class BotRunner:
                 exec_report.shares = shares
                 exec_report.price = price
                 exec_report.avgPrice = avg_price
+                exec_report.orderRef = order_ref
 
                 exec_time = self.get_safe_timestamp(exec_time_raw)
                 try:
@@ -955,23 +995,37 @@ class BotRunner:
                                and p.account in [self.bot.long_account, self.bot.short_account]
                                and p.position != 0]
 
-                    open_orders = [t for t in self.ib.openTrades()
-                                 if t.contract.conId == self.contract.conId
-                                 and t.order.account in [self.bot.long_account, self.bot.short_account]]
+                    open_trades = [t for t in self.ib.openTrades()
+                                   if t.contract.conId == self.contract.conId
+                                   and t.order.account in [self.bot.long_account, self.bot.short_account]]
+
+                    open_orders = [o for o in self.ib.openOrders()
+                                   if o.contract.conId == self.contract.conId
+                                   and o.account in [self.bot.long_account, self.bot.short_account]]
+                    # Refresh open orders snapshot to catch pending orders immediately after restart
+                    await self.ib.reqOpenOrdersAsync()
+                    await asyncio.sleep(0.5)
+                    open_orders = [o for o in self.ib.openOrders()
+                                   if o.contract.conId == self.contract.conId
+                                   and o.account in [self.bot.long_account, self.bot.short_account]]
 
                     if positions:
                         print(f"  Found {len(positions)} open positions:")
                         for p in positions:
                             print(f"    {p.account}: {p.position} shares @ {p.avgCost:.2f}")
 
-                    if open_orders:
-                        print(f"  Found {len(open_orders)} pending orders:")
-                        for t in open_orders:
-                            print(f"    Order {t.order.orderId} on {t.order.account}: "
+                    if open_trades or open_orders:
+                        print(f"  Found {len(open_trades) + len(open_orders)} pending orders:")
+                        for t in open_trades:
+                            print(f"    Trade {t.order.orderId} on {t.order.account}: "
                                   f"{t.order.action} {t.order.totalQuantity} {t.order.orderType} "
                                   f"(Status: {t.orderStatus.status})")
+                        for o in open_orders:
+                            print(f"    Order {o.orderId} on {o.account}: "
+                                  f"{o.action} {o.totalQuantity} {o.orderType} "
+                                  f"(State: {getattr(o, 'orderState', None) and o.orderState.status})")
 
-                    if not positions and not open_orders:
+                    if not positions and not open_trades and not open_orders:
                         print(f"  No positions or orders found - marking cycle {existing_cycle.cycle_number} as COMPLETED")
 
                         @sync_to_async
@@ -997,14 +1051,15 @@ class BotRunner:
                     @sync_to_async
                     def load_cycle_orders():
                         return list(existing_cycle.orders.filter(
-                            status__in=['PreSubmitted', 'Submitted', 'Filled']
+                            status__in=['PendingSubmit', 'PreSubmitted', 'Submitted', 'Filled']
                         ).select_related('cycle'))
 
                     db_orders = await load_cycle_orders()
 
-                    # Match DB orders with IBKR open orders and re-register callbacks
+                    # Match DB orders with IBKR open trades/orders and re-register callbacks
                     for db_order in db_orders:
-                        matching_trade = next((t for t in open_orders if t.order.orderId == db_order.order_id), None)
+                        matching_trade = next((t for t in open_trades if t.order.orderId == db_order.order_id), None)
+                        matching_order = next((o for o in open_orders if o.orderId == db_order.order_id), None)
                         if matching_trade:
                             print(f"[RECOVERY] Re-registering callbacks for {db_order.role} (order {db_order.order_id})")
                             self.order_map[db_order.order_id] = db_order
@@ -1017,6 +1072,9 @@ class BotRunner:
                                 self.active_trades['long'] = matching_trade
                             elif db_order.role == 'SHORT_SL':
                                 self.active_trades['short'] = matching_trade
+                        elif matching_order:
+                            print(f"[RECOVERY] Found open order {db_order.role} (order {db_order.order_id}) without trade; keeping for monitoring")
+                            self.order_map[db_order.order_id] = db_order
 
                     await self.log_event('CYCLE_RECOVERED', 'INFO',
                                        f"Recovered cycle {existing_cycle.cycle_number}, monitoring {len(self.order_map)} orders")
