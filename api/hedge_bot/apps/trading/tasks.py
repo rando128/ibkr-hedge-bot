@@ -80,7 +80,7 @@ def monitor_bots(timestamp: int):
 
 
 @app.task
-async def run_bot_worker(bot_id: int, task_id: str):
+async def run_bot_worker(bot_id: int, task_id: str = None):
     """
     Execute the bot trading logic for a specific bot.
 
@@ -96,22 +96,41 @@ async def run_bot_worker(bot_id: int, task_id: str):
     ----------
     bot_id : int
         The ID of the Bot to run
-    task_id : str
-        Unique task identifier for this worker instance
+    task_id : str, optional
+        Unique task identifier for this worker instance (for multi-worker coordination)
     """
     from asgiref.sync import sync_to_async
 
     logger.info(f"Bot worker started for bot {bot_id} (task_id={task_id})")
 
-    # Verify we own this bot (prevent race conditions)
-    @sync_to_async
-    def verify_ownership():
-        bot = Bot.objects.get(pk=bot_id)
-        return bot.worker_task_id == task_id
+    # Verify we own this bot (prevent race conditions) - only if task_id provided
+    if task_id:
+        @sync_to_async
+        def verify_ownership():
+            bot = Bot.objects.get(pk=bot_id)
+            return bot.worker_task_id == task_id
 
-    if not await verify_ownership():
-        logger.warning(f"Bot {bot_id} worker task {task_id} aborted - another worker owns this bot")
-        return
+        if not await verify_ownership():
+            logger.warning(f"Bot {bot_id} worker task {task_id} aborted - another worker owns this bot")
+            return
+    else:
+        # Legacy task without task_id - claim it now
+        @sync_to_async
+        def claim_bot():
+            bot = Bot.objects.get(pk=bot_id)
+            if not bot.worker_task_id:
+                task_id_generated = f"bot_{bot.id}_{int(timezone.now().timestamp())}"
+                bot.worker_task_id = task_id_generated
+                bot.worker_started_at = timezone.now()
+                bot.save()
+                return task_id_generated
+            return None
+
+        task_id = await claim_bot()
+        if not task_id:
+            logger.warning(f"Bot {bot_id} already has a worker, aborting legacy task")
+            return
+        logger.info(f"Legacy task claimed bot {bot_id} with generated task_id={task_id}")
 
     try:
         # Import here to avoid circular imports
