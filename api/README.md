@@ -58,16 +58,28 @@ poetry run python manage.py runserver 0.0.0.0:8080
 
 Access the admin at: http://127.0.0.1:8080/back/admin/
 
-#### 2. Start Procrastinate Workers
+#### 2. Start Procrastinate Workers (split queues)
 
-To run multiple bots in parallel, start the worker with concurrency enabled:
+Queues:
+- `monitor` : runs `monitor_bots` (lightweight, every minute)
+- `bots`    : runs `run_bot_worker` (long-running per-bot)
+
+Run a dedicated worker for each queue:
 
 ```bash
+# In repo root
 cd api
-poetry run python manage.py procrastinate worker --concurrency 5
+
+# Monitor queue (small, fast jobs)
+poetry run python manage.py procrastinate worker --queues monitor
+
+# Bot queue (long jobs). Adjust concurrency to number of bots you want in parallel.
+poetry run python manage.py procrastinate worker --queues bots --concurrency 5
 ```
 
-The `--concurrency 5` flag allows up to 5 bots to run simultaneously in the same worker process.
+Notes:
+- Without a `monitor` worker, monitor tasks will queue up while bot workers are busy.
+- You can scale the bots worker separately (e.g., run multiple `--queues bots` workers or increase `--concurrency`).
 
 
 ### Managing Bots via Django Admin

@@ -17,7 +17,7 @@ logger = logging.getLogger(__name__)
 
 
 @app.periodic(cron="* * * * *")  # Check every minute
-@app.task
+@app.task(queue="monitor")
 def monitor_bots(timestamp: int):
     """
     Monitor all bots and ensure RUNNING bots have active processes.
@@ -167,7 +167,7 @@ def monitor_bots(timestamp: int):
     logger.debug(f"Bot monitor: {running_bots.count()} running bots checked")
 
 
-@app.task
+@app.task(queue="bots")
 async def run_bot_worker(bot_id: int, task_id: str = None):
     """
     Execute the bot trading logic for a specific bot.
