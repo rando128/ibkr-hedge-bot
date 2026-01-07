@@ -280,8 +280,18 @@ class BotRunner:
         @sync_to_async
         def get_backfill_start():
             last_exec = self.cycle.executions.order_by('-executed_at').first()
-            anchor = last_exec.executed_at if last_exec else (self.cycle.created_at or dj_timezone.now())
-            return (anchor - timedelta(minutes=5)).astimezone(timezone.utc)
+            cycle_start = self.cycle.created_at or dj_timezone.now()
+
+            if last_exec:
+                # Use the earlier of: last_exec (with buffer) or cycle creation
+                # This ensures we catch executions even after weeks of downtime
+                recent_anchor = last_exec.executed_at - timedelta(minutes=5)
+                anchor = min(recent_anchor, cycle_start)
+                print(f"[BACKFILL] Using anchor: {anchor.strftime('%Y-%m-%d %H:%M:%S')} (last_exec: {last_exec.executed_at.strftime('%Y-%m-%d %H:%M:%S')}, cycle_start: {cycle_start.strftime('%Y-%m-%d %H:%M:%S')})")
+                return anchor.astimezone(timezone.utc)
+            else:
+                print(f"[BACKFILL] No executions yet, using cycle start: {cycle_start.strftime('%Y-%m-%d %H:%M:%S')}")
+                return cycle_start.astimezone(timezone.utc)
 
         start_dt = await get_backfill_start()
         # Use explicit UTC format to avoid IBKR warning about implied time zones
@@ -623,6 +633,142 @@ class BotRunner:
             await refresh_pnl()
             await self.log_event('CYCLE_RECONCILED', 'WARNING', f"Reconciled {updates} orders with IB snapshot")
         return updates
+
+    async def validate_tws_db_consistency(self):
+        """
+        Validate TWS state matches DB state for safe cycle recovery.
+
+        This ensures that positions and orders in TWS match what we expect from DB records,
+        preventing corruption from manual interventions or other bot instances.
+
+        Returns:
+            tuple: (is_consistent: bool, discrepancies: list of strings)
+        """
+        if not self.cycle or not self.contract:
+            return True, []
+
+        discrepancies = []
+
+        # Get TWS state
+        tws_positions = {}  # account -> qty
+        for pos in self.ib.positions():
+            if (pos.contract.conId == self.contract.conId and
+                pos.account in [self.bot.long_account, self.bot.short_account] and
+                pos.position != 0):
+                tws_positions[pos.account] = pos.position
+
+        tws_orders = {}  # orderId -> order
+        tws_orders_by_perm = {}  # permId -> order
+        for trade in self.ib.openTrades():
+            if (trade.contract.conId == self.contract.conId and
+                trade.order.account in [self.bot.long_account, self.bot.short_account]):
+                tws_orders[trade.order.orderId] = trade.order
+                if hasattr(trade.order, 'permId') and trade.order.permId:
+                    tws_orders_by_perm[trade.order.permId] = trade.order
+
+        # Get DB state
+        @sync_to_async
+        def get_db_state():
+            # Calculate net position from executions
+            db_positions = {}  # account -> net qty
+            for execution in self.cycle.executions.all():
+                account = execution.account
+                qty = float(execution.shares)
+                if execution.side == 'BUY':
+                    db_positions[account] = db_positions.get(account, 0) + qty
+                else:  # SELL
+                    db_positions[account] = db_positions.get(account, 0) - qty
+
+            # Get DB orders that should still be active
+            db_orders = {}  # orderId -> Order
+            db_orders_by_perm = {}  # permId -> Order
+            active_statuses = ['PendingSubmit', 'PreSubmitted', 'Submitted', 'PartiallyFilled']
+            for order in self.cycle.orders.filter(status__in=active_statuses):
+                if order.order_id:
+                    db_orders[order.order_id] = order
+                if order.perm_id:
+                    db_orders_by_perm[order.perm_id] = order
+
+            return db_positions, db_orders, db_orders_by_perm
+
+        db_positions, db_orders, db_orders_by_perm = await get_db_state()
+
+        print(f"\n[VALIDATION] Comparing TWS vs DB state:")
+        print(f"  TWS positions: {tws_positions}")
+        print(f"  DB positions: {db_positions}")
+        print(f"  TWS orders: {len(tws_orders)} open")
+        print(f"  DB orders: {len(db_orders)} active")
+
+        # 1. Validate positions match
+        all_accounts = set(tws_positions.keys()) | set(db_positions.keys())
+        for account in all_accounts:
+            tws_qty = tws_positions.get(account, 0)
+            db_qty = db_positions.get(account, 0)
+
+            # Allow small floating point differences (< 0.01 shares)
+            if abs(tws_qty - db_qty) > 0.01:
+                discrepancies.append(
+                    f"Position mismatch on {account}: TWS has {tws_qty} shares, "
+                    f"DB records {db_qty} shares from executions"
+                )
+
+        # 2. Validate orders - check for unknown orders in TWS
+        for order_id, tws_order in tws_orders.items():
+            perm_id = getattr(tws_order, 'permId', None)
+
+            # Try to find this order in DB by orderId or permId
+            found = False
+            if order_id in db_orders:
+                found = True
+            elif perm_id and perm_id in db_orders_by_perm:
+                found = True
+
+            if not found:
+                discrepancies.append(
+                    f"Unknown order in TWS: orderId={order_id}, permId={perm_id}, "
+                    f"account={tws_order.account}, {tws_order.action} {tws_order.totalQuantity} {tws_order.orderType}"
+                )
+
+        # 3. Check for orders in DB that are missing in TWS (might have filled/cancelled during downtime)
+        # Note: This is informational only, not a hard error, as backfill should have caught fills
+        for order_id, db_order in db_orders.items():
+            perm_id = db_order.perm_id
+
+            # Try to find this order in TWS
+            found = False
+            if order_id in tws_orders:
+                found = True
+            elif perm_id and perm_id in tws_orders_by_perm:
+                found = True
+
+            if not found:
+                # Order in DB as active but not in TWS - check if it was filled
+                @sync_to_async
+                def check_filled():
+                    return db_order.filled_quantity >= db_order.total_quantity and db_order.total_quantity > 0
+
+                is_filled = await check_filled()
+                if not is_filled:
+                    # Not filled and not in TWS - possible problem
+                    discrepancies.append(
+                        f"DB order {order_id} ({db_order.role}) marked as '{db_order.status}' "
+                        f"but not found in TWS open orders (might have been cancelled externally)"
+                    )
+
+        is_consistent = len(discrepancies) == 0
+
+        if is_consistent:
+            print(f"[VALIDATION] ✓ TWS and DB states are consistent")
+            await self.log_event('VALIDATION_PASSED', 'INFO', "TWS-DB state validation passed")
+        else:
+            print(f"[VALIDATION] ✗ Found {len(discrepancies)} discrepancies:")
+            for disc in discrepancies:
+                print(f"  - {disc}")
+            await self.log_event('VALIDATION_FAILED', 'ERROR',
+                               f"TWS-DB validation failed with {len(discrepancies)} discrepancies",
+                               data={'discrepancies': discrepancies})
+
+        return is_consistent, discrepancies
 
     async def check_bot_status(self):
         """Check if bot should continue running and send heartbeat"""
@@ -1317,6 +1463,49 @@ class BotRunner:
                     # Backfill any executions that may have been missed while the worker was down
                     await self.backfill_executions()
                     await self.reconcile_cycle_state()
+
+                    # Validate TWS state matches DB state before proceeding
+                    is_consistent, discrepancies = await self.validate_tws_db_consistency()
+
+                    if not is_consistent:
+                        # State mismatch detected - block recovery and require manual cleanup
+                        error_msg = (
+                            f"Cannot recover cycle {existing_cycle.cycle_number}: TWS state does not match DB state.\n"
+                            f"Found {len(discrepancies)} discrepancies:\n"
+                        )
+                        for disc in discrepancies:
+                            error_msg += f"  • {disc}\n"
+                        error_msg += (
+                            "\n⚠️  MANUAL INTERVENTION REQUIRED:\n"
+                            f"  1. Review the discrepancies above\n"
+                            f"  2. Use the PANIC button in admin to cancel all orders and close positions\n"
+                            f"  3. Restart the bot to begin a fresh cycle\n"
+                            f"\nThis safety check prevents data corruption from manual TWS interventions "
+                            f"or conflicting bot instances."
+                        )
+
+                        print(f"\n{'='*70}")
+                        print(f"[RECOVERY BLOCKED]")
+                        print(error_msg)
+                        print(f"{'='*70}\n")
+
+                        await self.log_event('RECOVERY_BLOCKED', 'CRITICAL', error_msg,
+                                           data={'discrepancies': discrepancies})
+
+                        # Mark bot as ERROR to prevent restart loop
+                        @sync_to_async
+                        def mark_bot_error():
+                            self.bot.status = 'ERROR'
+                            self.bot.save()
+
+                        await mark_bot_error()
+
+                        # Exit - user must use PANIC to clean up
+                        self.should_stop = True
+                        return
+
+                    # Validation passed - proceed with recovery
+                    print(f"[RECOVERY] ✓ Validation passed, continuing with cycle recovery...")
 
                     # Refresh open orders/trades after backfill (all accounts)
                     await self.ib.reqAllOpenOrdersAsync()
