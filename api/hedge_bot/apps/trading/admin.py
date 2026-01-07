@@ -164,112 +164,15 @@ class BotAdmin(admin.ModelAdmin):
         try:
             bot = Bot.objects.get(pk=bot_id)
             if bot.status in ('IDLE', 'STOPPED', 'ERROR'):
-                # PREFLIGHT CHECK: Verify no existing positions or orders
-                def check_ibkr_state():
-                    """Check for existing positions and orders"""
-                    import asyncio
-                    import nest_asyncio
+                # NOTE: Preflight check removed - bot runner now handles recovery with smart reconciliation
+                # The bot worker will:
+                # 1. Backfill executions (catch fills during downtime)
+                # 2. Reconcile order statuses
+                # 3. Validate TWS-DB consistency
+                # 4. Resume if consistent, or block with detailed error if not
+                logger.info(f"[START] Starting bot {bot_id} - smart reconciliation will handle state validation")
 
-                    # Create event loop for this thread
-                    loop = asyncio.new_event_loop()
-                    asyncio.set_event_loop(loop)
-                    nest_asyncio.apply(loop)
-
-                    # Import ib_insync after loop is set
-                    from ib_insync import IB, Stock
-
-                    ib = IB()
-
-                    try:
-                        # Connect to IBKR
-                        port = 7497 if bot.environment == 'PAPER' else 7496
-                        check_client_id = 998000 + bot.id
-
-                        logger.info(f"[PREFLIGHT] Connecting to TWS for preflight check...")
-                        loop.run_until_complete(
-                            ib.connectAsync('127.0.0.1', port, clientId=check_client_id, timeout=10)
-                        )
-
-                        # Set up contract
-                        contract = Stock(
-                            bot.symbol.upper(),
-                            bot.exchange,
-                            bot.currency
-                        )
-                        if bot.primary_exchange:
-                            contract.primaryExchange = bot.primary_exchange
-
-                        loop.run_until_complete(ib.qualifyContractsAsync(contract))
-
-                        # Request all open orders (including from other clients)
-                        loop.run_until_complete(ib.reqAllOpenOrdersAsync())
-                        # Give TWS time to send all orders
-                        ib.sleep(1)
-
-                        # Check for positions
-                        positions = [p for p in ib.positions()
-                                   if p.contract.conId == contract.conId
-                                   and p.account in [bot.long_account, bot.short_account]
-                                   and p.position != 0]
-
-                        # Check for open orders
-                        open_orders = [t for t in ib.openTrades()
-                                     if t.contract.conId == contract.conId
-                                     and t.order.account in [bot.long_account, bot.short_account]]
-
-                        return positions, open_orders, contract.conId
-
-                    finally:
-                        if ib.isConnected():
-                            ib.disconnect()
-                        try:
-                            loop.close()
-                        except:
-                            pass
-
-                # Run preflight check
-                try:
-                    positions, open_orders, contract_id = check_ibkr_state()
-
-                    # If there are positions or orders, block the start
-                    if positions or open_orders:
-                        error_msgs = []
-
-                        if positions:
-                            error_msgs.append(f"Found {len(positions)} open position(s):")
-                            for p in positions:
-                                error_msgs.append(f"  • {p.account}: {p.position} shares @ ${p.avgCost:.2f}")
-
-                        if open_orders:
-                            error_msgs.append(f"Found {len(open_orders)} pending order(s):")
-                            for t in open_orders:
-                                error_msgs.append(f"  • Order {t.order.orderId} on {t.order.account}: "
-                                                f"{t.order.action} {t.order.totalQuantity} {t.order.orderType} "
-                                                f"(Status: {t.orderStatus.status})")
-
-                        error_msgs.append("Please use the PANIC button to clean up before starting the bot.")
-
-                        messages.error(request, format_html('<br>'.join(error_msgs)))
-
-                        logger.warning(f"[PREFLIGHT] Bot {bot_id} start blocked due to existing positions/orders")
-
-                        Event.objects.create(
-                            bot=bot,
-                            event_type='BOT_START_BLOCKED',
-                            level='WARNING',
-                            message=f"Bot start blocked: {len(positions)} positions, {len(open_orders)} orders"
-                        )
-
-                        return redirect('admin:trading_bot_changelist')
-
-                    logger.info(f"[PREFLIGHT] Check passed - no positions or orders found (Contract ID: {contract_id})")
-
-                except Exception as e:
-                    logger.error(f"[PREFLIGHT] Check failed: {e}", exc_info=True)
-                    messages.error(request, f'Preflight check failed: {str(e)}. Cannot start bot.')
-                    return redirect('admin:trading_bot_changelist')
-
-                # Preflight passed - start the bot
+                # Start the bot
                 bot.status = 'RUNNING'
                 bot.started_at = timezone.now()
                 bot.stopped_at = None
@@ -279,13 +182,13 @@ class BotAdmin(admin.ModelAdmin):
                     bot=bot,
                     event_type='BOT_START',
                     level='INFO',
-                    message=f"Bot start requested from admin (preflight check passed)"
+                    message=f"Bot start requested from admin"
                 )
 
                 # Launch worker immediately
                 run_bot_worker.defer(bot_id=bot.id)
 
-                messages.success(request, f'Bot "{bot.name or bot.symbol}" started (preflight check passed)')
+                messages.success(request, f'Bot "{bot.name or bot.symbol}" started. Worker will validate state and resume if consistent.')
             else:
                 messages.warning(request, f'Bot is already {bot.status}')
         except Bot.DoesNotExist:
