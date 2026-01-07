@@ -312,6 +312,9 @@ class Event(models.Model):
         ('BACKFILL_APPLIED', 'Executions Backfilled'),
         ('BACKFILL_SKIP_NO_ID', 'Backfill Skipped Missing ID'),
         ('BACKFILL_MISSING_ORDER', 'Backfill Missing Order'),
+        ('WORKER_STALE', 'Worker Stale'),
+        ('WORKER_RESTART', 'Worker Restart'),
+        ('WORKER_CRASH', 'Worker Crash'),
     ]
 
     bot = models.ForeignKey(Bot, on_delete=models.CASCADE, related_name='events', null=True, blank=True)

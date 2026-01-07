@@ -6,7 +6,9 @@ These tasks monitor bot status and launch bot runners in the background.
 
 import asyncio
 import logging
+import traceback
 from procrastinate.contrib.django import app
+from django.db import models
 from django.utils import timezone
 
 from .models import Bot, Event
@@ -76,6 +78,12 @@ def monitor_bots(timestamp: int):
                 age = timezone.now() - bot.worker_last_heartbeat
                 if age > timedelta(minutes=2):
                     logger.warning(f"Bot {bot.id} worker appears stale (last heartbeat: {age} ago), will restart")
+                    Event.objects.create(
+                        bot=bot,
+                        event_type='WORKER_STALE',
+                        level='WARNING',
+                        message=f"Worker stale (last heartbeat {age} ago); restarting"
+                    )
                     bot.worker_task_id = None
                     bot.worker_started_at = None
                     bot.worker_last_heartbeat = None
@@ -87,6 +95,27 @@ def monitor_bots(timestamp: int):
         worker_started_at=None,
         worker_last_heartbeat=None
     )
+
+    # Mark clearly stuck bots (RUNNING with no worker and old/missing heartbeat) as ERROR for visibility
+    stuck_cutoff = timezone.now() - timedelta(minutes=10)
+    stuck_bots = Bot.objects.filter(
+        status='RUNNING',
+        worker_task_id__isnull=True
+    ).filter(
+        models.Q(worker_last_heartbeat__lt=stuck_cutoff) | models.Q(worker_last_heartbeat__isnull=True)
+    )
+
+    for bot in stuck_bots:
+        logger.error(f"Bot {bot.id} appears stuck (no worker, stale heartbeat); marking ERROR")
+        bot.status = 'ERROR'
+        bot.stopped_at = timezone.now()
+        bot.save(update_fields=['status', 'stopped_at'])
+        Event.objects.create(
+            bot=bot,
+            event_type='WORKER_STALE',
+            level='ERROR',
+            message="Bot marked ERROR: no worker and stale/missing heartbeat"
+        )
 
     logger.debug(f"Bot monitor: {running_bots.count()} running bots checked")
 
@@ -155,6 +184,7 @@ async def run_bot_worker(bot_id: int, task_id: str = None):
         await runner.run()
 
     except Exception as e:
+        tb_str = traceback.format_exc()
         logger.error(f"Bot worker {bot_id} crashed: {e}", exc_info=True)
 
         # Update bot status to ERROR (using sync_to_async)
@@ -171,9 +201,10 @@ async def run_bot_worker(bot_id: int, task_id: str = None):
 
                 Event.objects.create(
                     bot=bot,
-                    event_type='SYSTEM_ERROR',
+                    event_type='WORKER_CRASH',
                     level='CRITICAL',
-                    message=f"Bot worker crashed: {str(e)}"
+                    message=f"Bot worker crashed: {str(e)}",
+                    data={'traceback': tb_str}
                 )
 
             await update_bot_error()
@@ -276,9 +307,9 @@ def start_bot(bot_id: int):
 
         Event.objects.create(
             bot=bot,
-            event_type='BOT_START',
+            event_type='WORKER_RESTART' if bot.worker_task_id else 'BOT_START',
             level='INFO',
-            message=f"Bot start requested"
+            message="Bot start requested" if not bot.worker_task_id else "Restarting bot worker after stale/stop"
         )
 
         logger.info(f"Bot {bot_id} status set to RUNNING")
