@@ -41,10 +41,6 @@ def monitor_bots(timestamp: int):
             if bot.worker_last_heartbeat and timezone.now() - bot.worker_last_heartbeat < timedelta(minutes=2):
                 logger.warning(f"Bot {bot.id} has no worker_task_id but heartbeat is fresh; skipping duplicate start")
                 continue
-            # Extra guard: if there is an active cycle, assume a runner is (or was) working; avoid double-start
-            if bot.cycles.filter(status__in=['INITIALIZING', 'ENTERING', 'ACTIVE', 'TRANSITIONING']).exists():
-                logger.warning(f"Bot {bot.id} has no worker_task_id but active cycle exists; skipping duplicate start")
-                continue
 
             # No worker - launch one
             logger.info(f"Launching worker for bot {bot.id} ({bot.symbol})")

@@ -42,6 +42,7 @@ class BotRunner:
         self.commission_ids_seen = set()  # Track commission reports separately
         self.transitioning = False
         self.transition_done = False
+        self.connectivity_down = False  # Track IBKR↔TWS connectivity (1100/1101 down, 1102/1103 up)
 
         # Heartbeat tracking (for stale worker detection)
         self.last_heartbeat = 0  # timestamp of last heartbeat
@@ -811,6 +812,13 @@ class BotRunner:
             return
         msg = errorString if errorString else str(errorCode)
         code = errorCode if errorString else "INFO"
+
+        # Track IBKR <-> TWS connectivity health
+        if errorCode in (1100, 1101):
+            self.connectivity_down = True
+        elif errorCode in (1102, 1103):
+            self.connectivity_down = False
+
         # Schedule async logging (can't await in sync callback)
         asyncio.create_task(self.log_event('IBKR_ERROR', 'WARNING', f"IBKR {code}: {msg} (reqId={reqId})",
                                           data={'reqId': reqId, 'errorCode': code}))
@@ -1907,7 +1915,7 @@ class BotRunner:
 
             print("Waiting for both entries to fill...")
 
-            # Wait for fills with timeout
+            # Wait for fills with timeout; pause failure if IBKR connectivity is down
             deadline = asyncio.get_event_loop().time() + 30
             while not (l_trade.isDone() and s_trade.isDone()) and asyncio.get_event_loop().time() < deadline:
                 if not await self.check_bot_status():
@@ -1929,15 +1937,38 @@ class BotRunner:
             valid_statuses = {'Filled', 'PreSubmitted', 'Submitted'}
 
             if l_stat not in valid_statuses or s_stat not in valid_statuses:
-                print(f"\n!!! CRITICAL: ENTRY FAILURE !!!")
-                print(f"Long Status: {l_stat} (Filled: {l_filled})")
-                print(f"Short Status: {s_stat} (Filled: {s_filled})")
-                await self.log_event('ENTRY_FAILURE', 'ERROR',
-                                    f"Entry failed - Long: {l_stat}/{l_filled}, Short: {s_stat}/{s_filled}")
+                # If IBKR connectivity is down, keep waiting until it returns instead of panicking
+                if self.connectivity_down:
+                    print("\n[ENTRY] Connectivity down (1100/1101); delaying entry failure and waiting for recovery...")
+                    await self.log_event('ENTRY_PENDING', 'WARNING',
+                                        f"IBKR connectivity down; waiting for entry fills. Long: {l_stat}/{l_filled}, Short: {s_stat}/{s_filled}")
+                    # Wait up to an additional 120 seconds for recovery
+                    recovery_deadline = asyncio.get_event_loop().time() + 120
+                    while asyncio.get_event_loop().time() < recovery_deadline:
+                        if not await self.check_bot_status():
+                            await self.log_event('CYCLE_ABORTED', 'WARNING', "Bot stop detected during entry recovery wait")
+                            await self._panic_flatten()
+                            return False
+                        # If connectivity restored and orders filled, break
+                        if not self.connectivity_down and l_trade.orderStatus.status in valid_statuses and s_trade.orderStatus.status in valid_statuses:
+                            break
+                        await asyncio.sleep(2)
+                        self.ib.waitOnUpdate()
+                    # Refresh status values after recovery wait
+                    l_stat, s_stat = l_trade.orderStatus.status, s_trade.orderStatus.status
+                    l_filled, s_filled = l_trade.orderStatus.filled, s_trade.orderStatus.filled
 
-                # Panic flatten based on actual positions
-                await self._panic_flatten()
-                return False
+                # Re-evaluate after recovery wait
+                if l_stat not in valid_statuses or s_stat not in valid_statuses:
+                    print(f"\n!!! CRITICAL: ENTRY FAILURE !!!")
+                    print(f"Long Status: {l_stat} (Filled: {l_filled})")
+                    print(f"Short Status: {s_stat} (Filled: {s_filled})")
+                    await self.log_event('ENTRY_FAILURE', 'ERROR',
+                                        f"Entry failed - Long: {l_stat}/{l_filled}, Short: {s_stat}/{s_filled}")
+
+                    # Panic flatten based on actual positions
+                    await self._panic_flatten()
+                    return False
 
             # If orders are pending (not yet filled), wait for them to fill
             if l_stat != 'Filled' or s_stat != 'Filled':
@@ -2105,6 +2136,11 @@ class BotRunner:
         """
         print("\n[PANIC] Flattening all positions (unless trailing is active)...")
         await self.log_event('PANIC_FLATTEN', 'WARNING', "Flattening positions due to error")
+
+        # If IBKR connectivity is down, avoid sending new orders that will fail
+        if self.connectivity_down:
+            print("[PANIC] Skipping flatten because IBKR connectivity is down; will retry when connection is healthy.")
+            return
 
         # If trailing order is active, prefer to let it execute rather than sending new market orders
         trailing_active = False
