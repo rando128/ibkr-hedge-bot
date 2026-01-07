@@ -7,7 +7,6 @@ by Celery/Procrastinate tasks or management commands.
 
 import asyncio
 import math
-import random
 from datetime import datetime, timezone, timedelta
 from decimal import Decimal
 from typing import Optional
