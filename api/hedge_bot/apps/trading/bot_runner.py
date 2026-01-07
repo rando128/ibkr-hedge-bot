@@ -1349,15 +1349,18 @@ class BotRunner:
                 return
 
             # Connect to IBKR with a stable client ID per bot (persisted) to receive updates for existing orders after restart
+            async def persist_client_id(cid):
+                @sync_to_async
+                def _persist(cid_inner):
+                    Bot.objects.filter(pk=self.bot.id).update(last_client_id=cid_inner)
+                await _persist(cid)
+
             timestamp_component = None
             if self.bot.last_client_id:
                 self.client_id = self.bot.last_client_id
             else:
                 timestamp_component = int(time.time() * 1000) % 100000  # milliseconds, last 5 digits
                 self.client_id = (self.bot.id * 100000) + timestamp_component
-                @sync_to_async
-                def persist_client_id(cid):
-                    Bot.objects.filter(pk=self.bot.id).update(last_client_id=cid)
                 await persist_client_id(self.client_id)
             self.port = self.bot.port
 
@@ -1367,8 +1370,37 @@ class BotRunner:
             self.ib.execDetailsEvent += self.on_exec_details
             self.ib.orderStatusEvent += self.on_order_status
 
-            print(f"[CONNECTION] Connecting to TWS with clientId={self.client_id} (bot_id={self.bot.id}, timestamp={timestamp_component or 'reuse'})")
-            await self.ib.connectAsync(self.host, self.port, clientId=self.client_id)
+            async def connect_with_retry():
+                nonlocal timestamp_component
+                attempt = 0
+                while attempt < 2:
+                    try:
+                        print(f"[CONNECTION] Connecting to TWS with clientId={self.client_id} (bot_id={self.bot.id}, timestamp={timestamp_component or 'reuse'})")
+                        await self.ib.connectAsync(self.host, self.port, clientId=self.client_id)
+                        return True
+                    except Exception as e:
+                        msg = str(e).lower()
+                        duplicate_id = "client id is already in use" in msg or "already in use" in msg
+                        timeout = isinstance(e, TimeoutError)
+
+                        # Retry once with a fresh clientId if TWS says the ID is in use or we hit a timeout right after that error
+                        if attempt == 0 and (duplicate_id or timeout):
+                            if self.ib.isConnected():
+                                self.ib.disconnect()
+                            await asyncio.sleep(1)
+                            timestamp_component = int(time.time() * 1000) % 100000
+                            self.client_id = (self.bot.id * 100000) + timestamp_component
+                            await persist_client_id(self.client_id)
+                            print(f"[CONNECTION] Retrying with fresh clientId={self.client_id} after failure: {e}")
+                            attempt += 1
+                            continue
+                        raise
+                return False
+
+            connected = await connect_with_retry()
+            if not connected:
+                await self.log_event('SYSTEM_ERROR', 'ERROR', "Failed to connect to TWS after retrying clientId")
+                return
             await self.log_event('BOT_START', 'INFO', f"Bot started: {self.bot.symbol} (clientId={self.client_id})")
 
             # Contract setup - use bot configuration
