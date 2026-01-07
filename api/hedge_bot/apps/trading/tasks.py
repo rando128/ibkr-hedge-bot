@@ -33,6 +33,27 @@ def monitor_bots(timestamp: int):
     from django.db import transaction
     from datetime import timedelta
 
+    def launch_worker(bot):
+        """Atomically claim and launch a worker for the given bot."""
+        task_id = f"bot_{bot.id}_{int(timezone.now().timestamp())}"
+        with transaction.atomic():
+            bot_locked = Bot.objects.select_for_update().get(pk=bot.id)
+            if bot_locked.worker_task_id or bot_locked.status != 'RUNNING':
+                return None
+            now = timezone.now()
+            bot_locked.worker_task_id = task_id
+            bot_locked.worker_started_at = now
+            bot_locked.worker_last_heartbeat = now  # Initial heartbeat
+            bot_locked.save()
+        run_bot_worker.defer(bot_id=bot.id, task_id=task_id)
+        Event.objects.create(
+            bot=bot_locked,
+            event_type='WORKER_RESTART',
+            level='INFO',
+            message=f"Bot worker launched for {bot_locked.symbol}"
+        )
+        return task_id
+
     # Find all bots that should be running
     running_bots = Bot.objects.filter(status='RUNNING')
 
@@ -76,7 +97,8 @@ def monitor_bots(timestamp: int):
             # Has worker - check if it's stale (no heartbeat for more than 2 minutes)
             if bot.worker_last_heartbeat:
                 age = timezone.now() - bot.worker_last_heartbeat
-                if age > timedelta(minutes=4):
+                recent_start = bot.worker_started_at and (timezone.now() - bot.worker_started_at) < timedelta(minutes=3)
+                if not recent_start and age > timedelta(minutes=4):
                     logger.warning(f"Bot {bot.id} worker appears stale (last heartbeat: {age} ago), will restart")
                     Event.objects.create(
                         bot=bot,
@@ -88,6 +110,8 @@ def monitor_bots(timestamp: int):
                     bot.worker_started_at = None
                     bot.worker_last_heartbeat = None
                     bot.save()
+                    # Relaunch immediately after clearing
+                    launch_worker(bot)
 
     # Clean up bots that are no longer RUNNING
     Bot.objects.exclude(status='RUNNING').update(

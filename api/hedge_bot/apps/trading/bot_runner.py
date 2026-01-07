@@ -1361,6 +1361,9 @@ class BotRunner:
                 print(f"[ERROR] Bot status is {self.bot.status}, expected RUNNING")
                 return
 
+            # Initial heartbeat so monitor sees us immediately after restart
+            await self.send_heartbeat()
+
             # Connect to IBKR with a stable client ID per bot (persisted) to receive updates for existing orders after restart
             async def persist_client_id(cid):
                 @sync_to_async
