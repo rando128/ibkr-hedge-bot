@@ -2098,21 +2098,34 @@ class BotRunner:
             return False
 
     async def _panic_flatten(self):
-        """Flatten all positions for this contract/bot in case of errors"""
-        print("\n[PANIC] Flattening all positions...")
-        await self.log_event('PANIC_FLATTEN', 'WARNING', "Flattening all positions due to error")
+        """
+        Flatten all positions for this contract/bot in case of errors.
 
-        for acc in [self.bot.long_account, self.bot.short_account]:
-            pos = [p for p in self.ib.positions()
-                  if p.contract.conId == self.contract.conId and p.account == acc]
-            if pos and pos[0].position != 0:
-                qty = abs(pos[0].position)
-                action = 'SELL' if pos[0].position > 0 else 'BUY'
-                print(f"[PANIC] Flattening {acc}: {action} {qty} shares...")
-                from ib_insync import MarketOrder
-                self.ib.placeOrder(self.contract, MarketOrder(action, qty, account=acc))
+        If a trailing/benefit order is already active, let it run; otherwise exit ASAP.
+        """
+        print("\n[PANIC] Flattening all positions (unless trailing is active)...")
+        await self.log_event('PANIC_FLATTEN', 'WARNING', "Flattening positions due to error")
 
-        # Cleanup orphan orders
+        # If trailing order is active, prefer to let it execute rather than sending new market orders
+        trailing_active = False
+        trailing_roles = {'LONG_TRAIL', 'SHORT_TRAIL'}
+        if self.cycle:
+            trailing_active = self.cycle.orders.filter(role__in=trailing_roles, status__in=['Submitted', 'PreSubmitted']).exists()
+
+        if trailing_active:
+            print("[PANIC] Trailing order active; skipping manual flatten to avoid double fills.")
+        else:
+            for acc in [self.bot.long_account, self.bot.short_account]:
+                pos = [p for p in self.ib.positions()
+                      if p.contract.conId == self.contract.conId and p.account == acc]
+                if pos and pos[0].position != 0:
+                    qty = abs(pos[0].position)
+                    action = 'SELL' if pos[0].position > 0 else 'BUY'
+                    print(f"[PANIC] Flattening {acc}: {action} {qty} shares...")
+                    from ib_insync import MarketOrder
+                    self.ib.placeOrder(self.contract, MarketOrder(action, qty, account=acc))
+
+        # Cleanup orphan orders (stops, pending entries)
         await self._cleanup_orphan_orders()
 
     async def _cleanup_orphan_orders(self):

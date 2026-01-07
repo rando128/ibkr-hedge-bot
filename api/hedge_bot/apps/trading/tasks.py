@@ -41,6 +41,11 @@ def monitor_bots(timestamp: int):
             if bot.worker_last_heartbeat and timezone.now() - bot.worker_last_heartbeat < timedelta(minutes=2):
                 logger.warning(f"Bot {bot.id} has no worker_task_id but heartbeat is fresh; skipping duplicate start")
                 continue
+            # Extra guard: if there is an active cycle, assume a runner is (or was) working; avoid double-start
+            if bot.cycles.filter(status__in=['INITIALIZING', 'ENTERING', 'ACTIVE', 'TRANSITIONING']).exists():
+                logger.warning(f"Bot {bot.id} has no worker_task_id but active cycle exists; skipping duplicate start")
+                continue
+
             # No worker - launch one
             logger.info(f"Launching worker for bot {bot.id} ({bot.symbol})")
 
@@ -180,12 +185,13 @@ async def run_bot_worker(bot_id: int, task_id: str = None):
             logger.error(f"Failed to update bot status: {db_error}")
 
     finally:
-        # Clean up worker tracking
+        # Clean up worker tracking only if the bot is no longer running
         @sync_to_async
         def cleanup_worker():
             try:
                 bot = Bot.objects.get(pk=bot_id)
-                if bot.worker_task_id == task_id:
+                # Preserve worker_task_id while RUNNING to avoid duplicate starts mid-cycle
+                if bot.status != 'RUNNING' and bot.worker_task_id == task_id:
                     bot.worker_task_id = None
                     bot.worker_started_at = None
                     bot.worker_last_heartbeat = None
