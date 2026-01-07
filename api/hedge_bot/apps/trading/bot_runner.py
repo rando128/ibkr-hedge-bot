@@ -1374,9 +1374,25 @@ class BotRunner:
                 nonlocal timestamp_component
                 attempt = 0
                 while attempt < 2:
+                    duplicate_error = asyncio.Event()
+
+                    def _temp_error_handler(trade, reqId, errorCode, errorString, advancedOrderRejectJson=""):
+                        if errorCode == 326 or ("client id is already in use" in (errorString or "").lower()):
+                            duplicate_error.set()
+
+                    # Temporarily hook errorEvent to catch async 326 after connect
+                    self.ib.errorEvent += _temp_error_handler
                     try:
                         print(f"[CONNECTION] Connecting to TWS with clientId={self.client_id} (bot_id={self.bot.id}, timestamp={timestamp_component or 'reuse'})")
                         await self.ib.connectAsync(self.host, self.port, clientId=self.client_id)
+
+                        # Wait briefly to see if TWS emits 326 after login
+                        try:
+                            await asyncio.wait_for(duplicate_error.wait(), timeout=1.0)
+                            # 326 detected via errorEvent
+                            raise RuntimeError("client id is already in use (async 326)")
+                        except asyncio.TimeoutError:
+                            pass
                         return True
                     except Exception as e:
                         msg = str(e).lower()
@@ -1395,6 +1411,10 @@ class BotRunner:
                             attempt += 1
                             continue
                         raise
+                    finally:
+                        # Remove temporary handler
+                        if _temp_error_handler in self.ib.errorEvent:
+                            self.ib.errorEvent -= _temp_error_handler
                 return False
 
             connected = await connect_with_retry()

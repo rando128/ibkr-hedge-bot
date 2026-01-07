@@ -37,6 +37,10 @@ def monitor_bots(timestamp: int):
     for bot in running_bots:
         # Check if bot has a worker assigned
         if not bot.worker_task_id:
+            # Extra guard: if we recently saw a heartbeat, assume a worker is still alive even if the id was cleared
+            if bot.worker_last_heartbeat and timezone.now() - bot.worker_last_heartbeat < timedelta(minutes=2):
+                logger.warning(f"Bot {bot.id} has no worker_task_id but heartbeat is fresh; skipping duplicate start")
+                continue
             # No worker - launch one
             logger.info(f"Launching worker for bot {bot.id} ({bot.symbol})")
 
