@@ -1476,7 +1476,35 @@ class BotRunner:
                     is_consistent, discrepancies = await self.validate_tws_db_consistency()
 
                     if not is_consistent:
-                        # State mismatch detected - block recovery and require manual cleanup
+                        # Check if TWS is already clean (positions flat, no orders)
+                        # This happens after PANIC - we can safely complete the cycle
+                        tws_positions = [p for p in self.ib.positions()
+                                       if p.contract.conId == self.contract.conId
+                                       and p.account in [self.bot.long_account, self.bot.short_account]
+                                       and p.position != 0]
+                        tws_orders = [t for t in self.ib.openTrades()
+                                    if t.contract.conId == self.contract.conId
+                                    and t.order.account in [self.bot.long_account, self.bot.short_account]]
+
+                        if not tws_positions and not tws_orders:
+                            # TWS is clean - PANIC was run, just complete the stale cycle
+                            print(f"\n[VALIDATION] TWS is clean (no positions/orders), but DB has stale data.")
+                            print(f"[VALIDATION] Auto-completing stale cycle {existing_cycle.cycle_number}...")
+
+                            @sync_to_async
+                            def complete_stale_cycle():
+                                existing_cycle.status = 'COMPLETED'
+                                existing_cycle.completed_at = datetime.now(timezone.utc)
+                                existing_cycle.save()
+
+                            await complete_stale_cycle()
+                            await self.log_event('CYCLE_AUTO_COMPLETED', 'WARNING',
+                                               f"Auto-completed stale cycle {existing_cycle.cycle_number} after validation failure (TWS clean)")
+
+                            print(f"[VALIDATION] Cycle {existing_cycle.cycle_number} completed, will start fresh cycle next iteration")
+                            continue  # Start new cycle
+
+                        # TWS has positions/orders but they don't match DB - real problem
                         error_msg = (
                             f"Cannot recover cycle {existing_cycle.cycle_number}: TWS state does not match DB state.\n"
                             f"Found {len(discrepancies)} discrepancies:\n"
