@@ -886,6 +886,10 @@ class BotRunner:
         if trade and trade.order.orderId in self.order_map:
             order = self.order_map[trade.order.orderId]
         if not order:
+            # Early exit if cycle not yet initialized (race condition during startup)
+            if not self.cycle:
+                return
+
             @sync_to_async
             def find_order():
                 qs = self.cycle.orders.filter(account=getattr(exec_obj, 'acctNumber', None))
@@ -948,6 +952,10 @@ class BotRunner:
         order_ref = getattr(order_obj, 'orderRef', None) if order_obj else None
 
         if not order_id and not perm_id and not order_ref:
+            return
+
+        # Early exit if cycle not yet initialized (race condition during startup)
+        if not self.cycle:
             return
 
         @sync_to_async
