@@ -234,6 +234,9 @@ class BotRunner:
                 order_locked = Order.objects.select_for_update().get(pk=order.pk)
                 cycle_locked = Cycle.objects.select_for_update().get(pk=order_locked.cycle_id)
 
+                prev_status = order_locked.status
+                prev_filled = order_locked.filled_quantity
+
                 Execution.objects.create(
                     order=order_locked,
                     cycle=cycle_locked,
@@ -262,6 +265,15 @@ class BotRunner:
                 cycle_locked.net_pnl = cycle_locked.total_sells - cycle_locked.total_buys - cycle_locked.total_commission
                 cycle_locked.save()
 
+                print(
+                    f"[DB] Order {order_locked.order_id} ({order_locked.role}) "
+                    f"{prev_status}->{order_locked.status}, filled {prev_filled}->{order_locked.filled_quantity} "
+                    f"avg {order_locked.avg_fill_price}"
+                )
+                print(
+                    f"[DB] Cycle {cycle_locked.id} totals: buys={cycle_locked.total_buys} "
+                    f"sells={cycle_locked.total_sells} pnl={cycle_locked.net_pnl}"
+                )
                 return order_locked, cycle_locked
 
         return await persist()
@@ -284,10 +296,10 @@ class BotRunner:
             cycle_start = self.cycle.created_at or dj_timezone.now()
 
             if last_exec:
-                # Use the earlier of: last_exec (with buffer) or cycle creation
-                # This ensures we catch executions even after weeks of downtime
+                # Use the later of: last_exec (with buffer) or cycle creation
+                # to avoid importing executions from prior cycles
                 recent_anchor = last_exec.executed_at - timedelta(minutes=5)
-                anchor = min(recent_anchor, cycle_start)
+                anchor = max(recent_anchor, cycle_start)
                 print(f"[BACKFILL] Using anchor: {anchor.strftime('%Y-%m-%d %H:%M:%S')} (last_exec: {last_exec.executed_at.strftime('%Y-%m-%d %H:%M:%S')}, cycle_start: {cycle_start.strftime('%Y-%m-%d %H:%M:%S')})")
                 return anchor.astimezone(timezone.utc)
             else:
@@ -334,7 +346,9 @@ class BotRunner:
                     updated += 1
             return updated
 
-        await sync_perm_ids()
+        updated_perm = await sync_perm_ids()
+        if updated_perm:
+            print(f"[BACKFILL] Refreshed {updated_perm} orders from openOrders (permId/status sync)")
 
         new_execs = 0
 
@@ -607,19 +621,27 @@ class BotRunner:
 
             # No open trade for this order - align status with executions
             if order.status in pending_statuses:
-                last_exec = max(order.executions.all(), key=lambda e: e.executed_at) if order.executions.exists() else None
+                execs = list(order.executions.all())
+                last_exec = max(execs, key=lambda e: e.executed_at) if execs else None
                 new_status = None
-                if order.filled_quantity >= order.total_quantity and order.total_quantity > 0 and last_exec:
-                    new_status = 'Filled'
-                elif order.filled_quantity > 0 and last_exec:
-                    new_status = 'PartiallyFilled'
+                if execs:
+                    exec_qty = sum(e.shares for e in execs)
+                    exec_value = sum(e.shares * e.price for e in execs)
+                    avg_exec_price = exec_value / exec_qty if exec_qty else order.avg_fill_price
+                    if order.filled_quantity != exec_qty:
+                        order.filled_quantity = exec_qty
+                    if order.avg_fill_price != avg_exec_price:
+                        order.avg_fill_price = avg_exec_price
+                    if exec_qty >= order.total_quantity and order.total_quantity > 0:
+                        new_status = 'Filled'
+                    elif exec_qty > 0:
+                        new_status = 'PartiallyFilled'
 
                 if new_status:
                     @sync_to_async
                     def mark_filled():
                         order.status = new_status
                         if last_exec:
-                            order.avg_fill_price = last_exec.price
                             order.filled_at = last_exec.executed_at
                         order.save()
                     await mark_filled()
@@ -1225,6 +1247,9 @@ class BotRunner:
         def update_fill():
             try:
                 with transaction.atomic():
+                    prev_status = db_order.status
+                    prev_filled = db_order.filled_quantity
+
                     # Map IBKR side values (BOT/SLD) to our model values (BUY/SELL)
                     side_map = {'BOT': 'BUY', 'SLD': 'SELL'}
                     side = side_map.get(exec_obj.side, exec_obj.side)
@@ -1243,13 +1268,17 @@ class BotRunner:
 
                     # Update Order
                     db_order.filled_quantity += Decimal(str(exec_obj.shares))
-                    db_order.status = trade.orderStatus.status
+                    # Prefer IBKR status, but force Filled if we have full qty
+                    status = trade.orderStatus.status
+                    if db_order.filled_quantity >= db_order.total_quantity:
+                        status = 'Filled'
+                    db_order.status = status
                     if trade.orderStatus.avgFillPrice:
                         db_order.avg_fill_price = Decimal(str(trade.orderStatus.avgFillPrice))
                     perm_id = getattr(exec_obj, 'permId', None)
                     if perm_id:
                         db_order.perm_id = perm_id
-                    if trade.orderStatus.status == 'Filled':
+                    if db_order.status == 'Filled':
                         db_order.filled_at = exec_time
                     db_order.save()
 
@@ -1264,6 +1293,15 @@ class BotRunner:
                     cycle.save()
                     self.cycle = cycle
 
+                print(
+                    f"[DB] Order {db_order.order_id} ({db_order.role}) "
+                    f"{prev_status}->{db_order.status}, filled {prev_filled}->{db_order.filled_quantity} "
+                    f"avg {db_order.avg_fill_price}"
+                )
+                print(
+                    f"[DB] Cycle {cycle.id} totals: buys={cycle.total_buys} "
+                    f"sells={cycle.total_sells} pnl={cycle.net_pnl}"
+                )
                 print(f"--- [{self.fmt_ts(exec_time)}] {db_order.role} FILLED on {trade.order.account}: {exec_obj.shares} @ {exec_obj.price:.4f} ---")
                 return True
             except Exception as e:
