@@ -2146,7 +2146,12 @@ class BotRunner:
         trailing_active = False
         trailing_roles = {'LONG_TRAIL', 'SHORT_TRAIL'}
         if self.cycle:
-            trailing_active = self.cycle.orders.filter(role__in=trailing_roles, status__in=['Submitted', 'PreSubmitted']).exists()
+            trailing_active = await sync_to_async(
+                lambda: self.cycle.orders.filter(
+                    role__in=trailing_roles,
+                    status__in=['Submitted', 'PreSubmitted']
+                ).exists()
+            )()
 
         if trailing_active:
             print("[PANIC] Trailing order active; skipping manual flatten to avoid double fills.")
