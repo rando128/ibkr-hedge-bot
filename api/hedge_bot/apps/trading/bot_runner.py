@@ -1500,13 +1500,19 @@ class BotRunner:
                         await self.log_event('RECOVERY_BLOCKED', 'CRITICAL', error_msg,
                                            data={'discrepancies': discrepancies})
 
-                        # Mark bot as ERROR to prevent restart loop
+                        # Mark BOTH bot and cycle as ERROR to prevent restart loop
                         @sync_to_async
-                        def mark_bot_error():
+                        def mark_error_state():
+                            # Mark cycle as ERROR (discrepancy details already in Event log)
+                            existing_cycle.status = 'ERROR'
+                            existing_cycle.completed_at = datetime.now(timezone.utc)
+                            existing_cycle.save()
+
+                            # Mark bot as ERROR
                             self.bot.status = 'ERROR'
                             self.bot.save()
 
-                        await mark_bot_error()
+                        await mark_error_state()
 
                         # Exit - user must use PANIC to clean up
                         self.should_stop = True
