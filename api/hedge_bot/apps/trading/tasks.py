@@ -39,12 +39,14 @@ def monitor_bots(timestamp: int):
         with transaction.atomic():
             bot_locked = Bot.objects.select_for_update().get(pk=bot.id)
             if bot_locked.worker_task_id or bot_locked.status != 'RUNNING':
+                logger.debug(f"launch_worker: bot {bot.id} already owned or not RUNNING (status={bot_locked.status}, worker_task_id={bot_locked.worker_task_id})")
                 return None
             now = timezone.now()
             bot_locked.worker_task_id = task_id
             bot_locked.worker_started_at = now
             bot_locked.worker_last_heartbeat = now  # Initial heartbeat
             bot_locked.save()
+        logger.info(f"launch_worker: scheduled worker for bot {bot.id} ({bot.symbol}), task_id={task_id}")
         run_bot_worker.defer(bot_id=bot.id, task_id=task_id)
         Event.objects.create(
             bot=bot_locked,
@@ -58,11 +60,15 @@ def monitor_bots(timestamp: int):
     running_bots = Bot.objects.filter(status='RUNNING')
 
     for bot in running_bots:
+        has_active_cycle = bot.cycles.filter(
+            status__in=['INITIALIZING', 'ENTERING', 'ACTIVE', 'TRANSITIONING', 'ERROR']
+        ).exists()
+
         # Check if bot has a worker assigned
         if not bot.worker_task_id:
             # Extra guard: if we recently saw a heartbeat, assume a worker is still alive even if the id was cleared
-            if bot.worker_last_heartbeat and timezone.now() - bot.worker_last_heartbeat < timedelta(minutes=2):
-                logger.warning(f"Bot {bot.id} has no worker_task_id but heartbeat is fresh; skipping duplicate start")
+            if not has_active_cycle and bot.worker_last_heartbeat and timezone.now() - bot.worker_last_heartbeat < timedelta(minutes=2):
+                logger.warning(f"Bot {bot.id} has no worker_task_id but heartbeat is fresh; skipping duplicate start (no active cycle)")
                 continue
 
             # No worker - launch one
@@ -93,13 +99,18 @@ def monitor_bots(timestamp: int):
                         level='INFO',
                         message=f"Bot worker launched for {bot_locked.symbol}"
                     )
+                    logger.info(f"monitor_bots: worker launched for bot {bot.id} ({bot.symbol}) task_id={task_id}")
         else:
             # Has worker - check if it's stale (no heartbeat for more than 2 minutes)
             if bot.worker_last_heartbeat:
                 age = timezone.now() - bot.worker_last_heartbeat
                 recent_start = bot.worker_started_at and (timezone.now() - bot.worker_started_at) < timedelta(minutes=3)
-                if not recent_start and age > timedelta(minutes=4):
-                    logger.warning(f"Bot {bot.id} worker appears stale (last heartbeat: {age} ago), will restart")
+
+                # If we have an active cycle, be stricter: restart quickly when heartbeat > 90s
+                fast_stale = age > timedelta(seconds=45) if has_active_cycle else False
+
+                if fast_stale or (not recent_start and age > timedelta(minutes=4)):
+                    logger.warning(f"monitor_bots: worker stale for bot {bot.id} (age={age}, active_cycle={has_active_cycle}), restarting")
                     Event.objects.create(
                         bot=bot,
                         event_type='WORKER_STALE',
@@ -112,6 +123,18 @@ def monitor_bots(timestamp: int):
                     bot.save()
                     # Relaunch immediately after clearing
                     launch_worker(bot)
+                else:
+                    logger.debug(f"monitor_bots: worker healthy for bot {bot.id} (age={age}, active_cycle={has_active_cycle}, recent_start={recent_start})")
+            else:
+                if has_active_cycle:
+                    logger.warning(f"monitor_bots: bot {bot.id} has worker_task_id but no heartbeat; relaunching (active cycle present)")
+                    bot.worker_task_id = None
+                    bot.worker_started_at = None
+                    bot.worker_last_heartbeat = None
+                    bot.save()
+                    launch_worker(bot)
+                else:
+                    logger.debug(f"monitor_bots: bot {bot.id} has worker_task_id but no heartbeat yet; waiting")
 
     # Clean up bots that are no longer RUNNING
     Bot.objects.exclude(status='RUNNING').update(
