@@ -1407,7 +1407,7 @@ class BotRunner:
                 @sync_to_async
                 def check_active_cycle():
                     return self.bot.cycles.filter(
-                        status__in=['INITIALIZING', 'ENTERING', 'ACTIVE', 'TRANSITIONING']
+                        status__in=['INITIALIZING', 'ENTERING', 'ACTIVE', 'TRANSITIONING', 'ERROR']
                     ).order_by('-id').first()
 
                 existing_cycle = await check_active_cycle()
