@@ -2041,7 +2041,8 @@ class BotRunner:
         except Exception as e:
             print(f"[CYCLE ERROR] {e}")
             await self.log_event('CYCLE_ERROR', 'ERROR', f"Cycle execution error: {str(e)}")
-            await self._panic_flatten()
+            # Don't flatten on error - smart reconciliation will handle recovery on restart
+            # Use PANIC button if immediate position closure is needed
             return False
 
     async def _panic_flatten(self):
