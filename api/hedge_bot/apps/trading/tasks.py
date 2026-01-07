@@ -76,7 +76,7 @@ def monitor_bots(timestamp: int):
             # Has worker - check if it's stale (no heartbeat for more than 2 minutes)
             if bot.worker_last_heartbeat:
                 age = timezone.now() - bot.worker_last_heartbeat
-                if age > timedelta(minutes=2):
+                if age > timedelta(minutes=4):
                     logger.warning(f"Bot {bot.id} worker appears stale (last heartbeat: {age} ago), will restart")
                     Event.objects.create(
                         bot=bot,
@@ -256,19 +256,19 @@ def stop_bot(bot_id: int):
             print(f"[STOP_BOT_TASK] Bot {bot_id} is not running (status: {bot.status})")
             return
 
-        logger.info(f"[STOP_BOT_TASK] Setting bot {bot_id} status to STOPPED")
-        print(f"[STOP_BOT_TASK] Setting bot {bot_id} status to STOPPED")
+            logger.info(f"[STOP_BOT_TASK] Setting bot {bot_id} status to STOPPED")
+            print(f"[STOP_BOT_TASK] Setting bot {bot_id} status to STOPPED")
 
-        bot.status = 'STOPPED'
-        bot.stopped_at = timezone.now()
-        bot.save()
+            bot.status = 'STOPPED'
+            bot.stopped_at = timezone.now()
+            bot.save()
 
-        Event.objects.create(
-            bot=bot,
-            event_type='BOT_STOP',
-            level='INFO',
-            message=f"Bot stop requested"
-        )
+            Event.objects.create(
+                bot=bot,
+                event_type='BOT_STOP',
+                level='INFO',
+                message=f"Bot stop requested"
+            )
 
         logger.info(f"[STOP_BOT_TASK] Stop signal sent to bot {bot_id}, status updated to STOPPED")
         print(f"[STOP_BOT_TASK] Stop signal sent to bot {bot_id}, status updated to STOPPED")

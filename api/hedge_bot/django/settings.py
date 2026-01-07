@@ -67,6 +67,13 @@ with EnvManager(ModelWDjango()) as env:
     )
 
     # ---
+    # Admin
+    # ---
+
+    # Increase field limit for Event changelist with many records
+    DATA_UPLOAD_MAX_NUMBER_FIELDS = 10000
+
+    # ---
     # OpenAPI Schema
     # ---
 

@@ -1216,6 +1216,11 @@ class BotRunner:
         exec_obj = fill.execution
         exec_time = self.get_safe_timestamp(exec_obj.time)
 
+        # Ensure we have a live connection before touching DB/IB state
+        if not await self.ensure_connection():
+            await self.log_event('SYSTEM_ERROR', 'ERROR', "Fill handling skipped: IB connection lost")
+            return
+
         @sync_to_async
         def update_fill():
             try:
@@ -1685,6 +1690,9 @@ class BotRunner:
                             await self.backfill_executions()
                             await self.reconcile_cycle_state()
                             last_exec_poll = time.time()
+
+                        # Keep heartbeat fresh during long monitoring to avoid stale-worker trips
+                        await self.send_heartbeat()
 
                         # Check if all positions are flat
                         pos = [p for p in self.ib.positions()
