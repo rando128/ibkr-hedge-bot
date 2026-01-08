@@ -1,7 +1,16 @@
 from django.contrib import admin
 from django.utils.html import format_html
 from django.urls import reverse
-from .models import Bot, Cycle, Order, Execution, Event
+from .models import (
+    Bot,
+    Cycle,
+    Order,
+    Execution,
+    Event,
+    ProcrastinateJob,
+    ProcrastinateWorker,
+    ProcrastinateEvent,
+)
 from .tasks import start_bot, stop_bot
 
 
@@ -208,18 +217,13 @@ class BotAdmin(admin.ModelAdmin):
 
         logger = logging.getLogger(__name__)
         logger.info(f"[ADMIN] Stop button clicked for bot {bot_id}")
-        print(f"[ADMIN] Stop button clicked for bot {bot_id}")
 
         try:
             bot = Bot.objects.get(pk=bot_id)
             logger.info(f"[ADMIN] Bot {bot_id} current status: {bot.status}")
-            print(f"[ADMIN] Bot {bot_id} current status: {bot.status}")
 
             if bot.status == 'RUNNING':
                 # Update status directly instead of deferring
-                logger.info(f"[ADMIN] Setting bot {bot_id} status to STOPPED directly")
-                print(f"[ADMIN] Setting bot {bot_id} status to STOPPED directly")
-
                 bot.status = 'STOPPED'
                 bot.stopped_at = timezone.now()
                 bot.save()
@@ -228,11 +232,10 @@ class BotAdmin(admin.ModelAdmin):
                     bot=bot,
                     event_type='BOT_STOP',
                     level='INFO',
-                    message=f"Bot stop requested from admin"
+                    message="Bot stop requested from admin"
                 )
 
                 logger.info(f"[ADMIN] Bot {bot_id} status updated to STOPPED")
-                print(f"[ADMIN] Bot {bot_id} status updated to STOPPED")
                 messages.success(request, f'Bot "{bot.name or bot.symbol}" stopped')
             else:
                 messages.warning(request, f'Bot is not running (status: {bot.status})')
@@ -277,8 +280,6 @@ class BotAdmin(admin.ModelAdmin):
 
                 ib = IB()
 
-                # Don't call util.patchAsyncio() - we're managing the loop ourselves
-
                 try:
                     # Connect to IBKR synchronously (ib_insync will use our loop)
                     port = 7497 if bot.environment == 'PAPER' else 7496
@@ -305,68 +306,35 @@ class BotAdmin(admin.ModelAdmin):
 
                     # Request all open orders (including from other clients)
                     loop.run_until_complete(ib.reqAllOpenOrdersAsync())
-                    # Give TWS time to send all orders
                     ib.sleep(1)
 
                     cancelled_orders = 0
                     closed_positions = 0
 
                     # 1. Cancel all open orders for this bot's accounts
-                    print(f"[PANIC] Checking for open orders...")
-                    logger.info(f"[PANIC] Checking for open orders...")
-                    print(f"[PANIC] Found {len(ib.openTrades())} total open trades")
-                    logger.info(f"[PANIC] Found {len(ib.openTrades())} total open trades")
-
-                    # Count orders that need cancellation
-                    orders_for_this_bot = []
+                    logger.info("[PANIC] Checking for open orders...")
                     for trade in ib.openTrades():
                         if (trade.contract.conId == contract.conId and
                             trade.order.account in [bot.long_account, bot.short_account]):
-                            print(f"[PANIC] Found order {trade.order.orderId} "
-                                  f"({trade.order.orderType} {trade.order.action} {trade.order.totalQuantity}) "
-                                  f"on {trade.order.account} - placed by client {trade.order.clientId}")
-                            orders_for_this_bot.append(trade)
+                            logger.info(
+                                "[PANIC] Cancelling order %s (%s %s %s) on %s client %s",
+                                trade.order.orderId,
+                                trade.order.orderType,
+                                trade.order.action,
+                                trade.order.totalQuantity,
+                                trade.order.account,
+                                trade.order.clientId,
+                            )
+                            ib.cancelOrder(trade.order)
                             cancelled_orders += 1
 
-                    print(f"[PANIC] Total orders to cancel: {cancelled_orders}")
-
-                    # Use Master Client ID (0) to cancel orders placed by any client
                     if cancelled_orders > 0:
-                        print(f"[PANIC] Using reqGlobalCancel to cancel ALL orders...")
-                        logger.warning(f"[PANIC] Using reqGlobalCancel to cancel ALL orders")
-
-                        # reqGlobalCancel() cancels ALL orders for ALL accounts on this API connection
-                        # This is the nuclear option but it works across all clients
+                        # Nuclear option to ensure everything is cancelled
                         ib.reqGlobalCancel()
-
-                        print(f"[PANIC] Waiting for {cancelled_orders} order cancellations...")
-                        logger.info(f"[PANIC] Waiting for {cancelled_orders} order cancellations...")
+                        logger.warning(f"[PANIC] reqGlobalCancel invoked for {cancelled_orders} orders")
                         ib.sleep(3)
 
-                        # Re-fetch all orders to check status
-                        loop.run_until_complete(ib.reqAllOpenOrdersAsync())
-                        ib.sleep(1)
-
-                        # Verify cancellations
-                        still_open_count = 0
-                        for trade in ib.openTrades():
-                            if (trade.contract.conId == contract.conId and
-                                trade.order.account in [bot.long_account, bot.short_account]):
-                                print(f"[PANIC] ⚠ Order {trade.order.orderId} still open, status: {trade.orderStatus.status}")
-                                logger.warning(f"[PANIC] Order {trade.order.orderId} still open")
-                                still_open_count += 1
-
-                        if still_open_count > 0:
-                            print(f"[PANIC] ⚠ {still_open_count} orders still open after cancellation attempt")
-                            logger.warning(f"[PANIC] {still_open_count} orders still open after cancellation attempt")
-                        else:
-                            print(f"[PANIC] ✓ All {cancelled_orders} orders successfully cancelled")
-                            logger.info(f"[PANIC] All {cancelled_orders} orders successfully cancelled")
-                    else:
-                        print("[PANIC] No orders matched for cancellation")
-
                     # 2. Close all positions for this bot's accounts
-                    logger.info(f"[PANIC] Checking for open positions...")
                     for position in ib.positions():
                         if (position.contract.conId == contract.conId and
                             position.account in [bot.long_account, bot.short_account] and
@@ -384,55 +352,84 @@ class BotAdmin(admin.ModelAdmin):
 
                     # Wait for fills
                     if closed_positions > 0:
-                        logger.info(f"[PANIC] Waiting for {closed_positions} position closures...")
                         ib.sleep(3)
 
                     return cancelled_orders, closed_positions
 
-                except Exception as e:
-                    logger.error(f"[PANIC] Error during panic operations: {e}", exc_info=True)
-                    raise
                 finally:
                     if ib.isConnected():
                         ib.disconnect()
-                        logger.info("[PANIC] Disconnected from TWS")
-
-                    # Clean up event loop
                     try:
                         loop.close()
-                    except:
+                    except Exception:
                         pass
 
             # Execute panic
-            try:
-                cancelled_orders, closed_positions = execute_panic()
+            cancelled_orders, closed_positions = execute_panic()
 
-                # 3. Stop the bot
-                bot.status = 'STOPPED'
-                bot.stopped_at = timezone.now()
-                bot.save()
+            # 3. Stop the bot
+            bot.status = 'STOPPED'
+            bot.stopped_at = timezone.now()
+            bot.save()
 
-                Event.objects.create(
-                    bot=bot,
-                    event_type='PANIC_STOP',
-                    level='CRITICAL',
-                    message=f"PANIC: Cancelled {cancelled_orders} orders, closed {closed_positions} positions"
-                )
+            Event.objects.create(
+                bot=bot,
+                event_type='PANIC_STOP',
+                level='CRITICAL',
+                message=f"PANIC: Cancelled {cancelled_orders} orders, closed {closed_positions} positions"
+            )
 
-                messages.warning(
-                    request,
-                    f'PANIC executed for "{bot.name or bot.symbol}": '
-                    f'Cancelled {cancelled_orders} orders, closed {closed_positions} positions, bot stopped'
-                )
-
-            except Exception as e:
-                logger.error(f"[PANIC] Failed to execute panic: {e}", exc_info=True)
-                messages.error(request, f'PANIC failed: {str(e)}')
+            messages.warning(
+                request,
+                f'PANIC executed for "{bot.name or bot.symbol}": '
+                f'Cancelled {cancelled_orders} orders, closed {closed_positions} positions, bot stopped'
+            )
 
         except Bot.DoesNotExist:
             messages.error(request, 'Bot not found')
+        except Exception as e:
+            logger.error(f"[PANIC] Failed to execute panic: {e}", exc_info=True)
+            messages.error(request, f'PANIC failed: {str(e)}')
 
         return redirect('admin:trading_bot_changelist')
+
+
+@admin.register(ProcrastinateWorker)
+class ProcrastinateWorkerAdmin(admin.ModelAdmin):
+    list_display = ['id', 'last_heartbeat', 'doing_jobs']
+    readonly_fields = ['last_heartbeat']
+    ordering = ['-last_heartbeat']
+    search_fields = ['id']
+
+    def doing_jobs(self, obj):
+        return obj.jobs.filter(status='doing').count()
+    doing_jobs.short_description = 'Active jobs'
+
+
+@admin.register(ProcrastinateJob)
+class ProcrastinateJobAdmin(admin.ModelAdmin):
+    list_display = ['id', 'task_name', 'queue_name', 'status', 'attempts', 'scheduled_at', 'worker_link', 'abort_requested']
+    list_filter = ['status', 'queue_name', 'task_name', 'abort_requested']
+    search_fields = ['id', 'task_name', 'queue_name', 'lock', 'queueing_lock']
+    readonly_fields = ['id', 'task_name', 'queue_name', 'priority', 'lock', 'queueing_lock', 'args', 'status',
+                      'scheduled_at', 'attempts', 'abort_requested', 'worker']
+    ordering = ['-id']
+
+    def worker_link(self, obj):
+        if obj.worker_id:
+            url = reverse('admin:trading_procrastinateworker_change', args=[obj.worker_id])
+            return format_html('<a href="{}">Worker {}</a>', url, obj.worker_id)
+        return '-'
+    worker_link.short_description = 'Worker'
+
+
+@admin.register(ProcrastinateEvent)
+class ProcrastinateEventAdmin(admin.ModelAdmin):
+    list_display = ['id', 'job', 'type', 'at']
+    list_filter = ['type']
+    search_fields = ['id', 'job__id', 'type']
+    readonly_fields = ['job', 'type', 'at']
+    ordering = ['-at', '-id']
 
 
 @admin.register(Cycle)

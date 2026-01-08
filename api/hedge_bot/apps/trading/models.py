@@ -350,3 +350,67 @@ class Event(models.Model):
 
     def __str__(self):
         return f"[{self.level}] {self.event_type}: {self.message[:50]}"
+
+
+# === Procrastinate introspection models (unmanaged, admin-only) ===
+class ProcrastinateWorker(models.Model):
+    id = models.BigAutoField(primary_key=True)
+    last_heartbeat = models.DateTimeField()
+
+    class Meta:
+        managed = False
+        db_table = 'procrastinate_workers'
+        verbose_name = 'Procrastinate Worker'
+        verbose_name_plural = 'Procrastinate Workers'
+
+    def __str__(self):
+        return f"Worker {self.id}"
+
+
+class ProcrastinateJob(models.Model):
+    id = models.BigAutoField(primary_key=True)
+    queue_name = models.CharField(max_length=128)
+    task_name = models.CharField(max_length=128)
+    priority = models.IntegerField(default=0)
+    lock = models.TextField(null=True, blank=True)
+    queueing_lock = models.TextField(null=True, blank=True)
+    args = models.JSONField(default=dict)
+    status = models.CharField(max_length=20)
+    scheduled_at = models.DateTimeField(null=True, blank=True)
+    attempts = models.IntegerField(default=0)
+    abort_requested = models.BooleanField(default=False)
+    worker = models.ForeignKey(
+        ProcrastinateWorker,
+        db_column='worker_id',
+        null=True,
+        blank=True,
+        on_delete=models.DO_NOTHING,
+        related_name='jobs'
+    )
+
+    class Meta:
+        managed = False
+        db_table = 'procrastinate_jobs'
+        verbose_name = 'Procrastinate Job'
+        verbose_name_plural = 'Procrastinate Jobs'
+        ordering = ['-id']
+
+    def __str__(self):
+        return f"Job {self.id} ({self.task_name})"
+
+
+class ProcrastinateEvent(models.Model):
+    id = models.BigAutoField(primary_key=True)
+    job = models.ForeignKey(ProcrastinateJob, on_delete=models.CASCADE, related_name='events')
+    type = models.CharField(max_length=30)
+    at = models.DateTimeField(null=True, blank=True)
+
+    class Meta:
+        managed = False
+        db_table = 'procrastinate_events'
+        verbose_name = 'Procrastinate Event'
+        verbose_name_plural = 'Procrastinate Events'
+        ordering = ['-at', '-id']
+
+    def __str__(self):
+        return f"Event {self.id} on job {self.job_id}"
