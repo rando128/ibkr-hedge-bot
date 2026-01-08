@@ -106,8 +106,8 @@ def monitor_bots(timestamp: int):
                 age = timezone.now() - bot.worker_last_heartbeat
                 recent_start = bot.worker_started_at and (timezone.now() - bot.worker_started_at) < timedelta(minutes=3)
 
-                # If we have an active cycle, be stricter: restart quickly when heartbeat > 90s
-                fast_stale = age > timedelta(seconds=45) if has_active_cycle else False
+                # If we have an active cycle, be moderately stricter but avoid 1-min false positives
+                fast_stale = age > timedelta(minutes=3) if has_active_cycle else False
 
                 if fast_stale or (not recent_start and age > timedelta(minutes=4)):
                     logger.warning(f"monitor_bots: worker stale for bot {bot.id} (age={age}, active_cycle={has_active_cycle}), restarting")

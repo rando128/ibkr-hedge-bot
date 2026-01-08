@@ -172,10 +172,13 @@ class BotAdmin(admin.ModelAdmin):
                 # 4. Resume if consistent, or block with detailed error if not
                 logger.info(f"[START] Starting bot {bot_id} - smart reconciliation will handle state validation")
 
-                # Start the bot
+                # Start the bot (monitor will launch the worker)
                 bot.status = 'RUNNING'
                 bot.started_at = timezone.now()
                 bot.stopped_at = None
+                bot.worker_task_id = None
+                bot.worker_started_at = None
+                bot.worker_last_heartbeat = None
                 bot.save()
 
                 Event.objects.create(
@@ -185,8 +188,8 @@ class BotAdmin(admin.ModelAdmin):
                     message=f"Bot start requested from admin"
                 )
 
-                # Launch worker immediately
-                run_bot_worker.defer(bot_id=bot.id)
+                # Do not launch worker here; monitor_bots will claim and start it to avoid races
+                # run_bot_worker.defer(bot_id=bot.id)
 
                 messages.success(request, f'Bot "{bot.name or bot.symbol}" started. Worker will validate state and resume if consistent.')
             else:
@@ -434,11 +437,23 @@ class BotAdmin(admin.ModelAdmin):
 
 @admin.register(Cycle)
 class CycleAdmin(admin.ModelAdmin):
-    list_display = ['id', 'bot', 'cycle_number', 'symbol', 'status', 'net_pnl', 'created_at']
+    list_display = ['id', 'bot', 'cycle_number', 'symbol', 'status', 'net_pnl', 'created_at', 'orders_button', 'events_button']
     list_filter = ['status', 'symbol']
     search_fields = ['symbol']
     readonly_fields = ['created_at', 'updated_at', 'completed_at', 'total_buys', 'total_sells', 'total_commission', 'net_pnl']
     raw_id_fields = ['bot']
+
+    def orders_button(self, obj):
+        """Display button to view orders for this cycle"""
+        url = reverse('admin:trading_order_changelist') + f'?cycle_id__exact={obj.id}'
+        return format_html('<a class="button" href="{}">Orders</a>', url)
+    orders_button.short_description = 'Orders'
+
+    def events_button(self, obj):
+        """Display button to view events for this cycle"""
+        url = reverse('admin:trading_event_changelist') + f'?cycle_id__exact={obj.id}'
+        return format_html('<a class="button" href="{}">Events</a>', url)
+    events_button.short_description = 'Logs'
 
 
 @admin.register(Order)
@@ -462,7 +477,7 @@ class ExecutionAdmin(admin.ModelAdmin):
 @admin.register(Event)
 class EventAdmin(admin.ModelAdmin):
     list_display = ['id', 'event_type', 'level', 'bot', 'cycle', 'created_at', 'message_preview']
-    list_filter = ['event_type', 'level', 'created_at']
+    list_filter = ['event_type', 'level', 'bot', 'created_at']
     search_fields = ['message']
     readonly_fields = ['created_at']
     raw_id_fields = ['bot', 'cycle', 'order']
