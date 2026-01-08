@@ -396,7 +396,7 @@ class BotAdmin(admin.ModelAdmin):
 
 @admin.register(ProcrastinateWorker)
 class ProcrastinateWorkerAdmin(admin.ModelAdmin):
-    list_display = ['id', 'last_heartbeat', 'doing_jobs']
+    list_display = ['id', 'last_heartbeat', 'doing_jobs', 'jobs_link']
     readonly_fields = ['last_heartbeat']
     ordering = ['-last_heartbeat']
     search_fields = ['id']
@@ -405,10 +405,15 @@ class ProcrastinateWorkerAdmin(admin.ModelAdmin):
         return obj.jobs.filter(status='doing').count()
     doing_jobs.short_description = 'Active jobs'
 
+    def jobs_link(self, obj):
+        url = reverse('admin:trading_procrastinatejob_changelist') + f'?worker__id__exact={obj.id}'
+        return format_html('<a class="button" href="{}">View jobs</a>', url)
+    jobs_link.short_description = 'Jobs'
+
 
 @admin.register(ProcrastinateJob)
 class ProcrastinateJobAdmin(admin.ModelAdmin):
-    list_display = ['id', 'task_name', 'queue_name', 'status', 'attempts', 'scheduled_at', 'worker_link', 'abort_requested']
+    list_display = ['id', 'task_name', 'queue_name', 'status', 'attempts', 'scheduled_at', 'worker_link', 'events_link', 'abort_requested']
     list_filter = ['status', 'queue_name', 'task_name', 'abort_requested']
     search_fields = ['id', 'task_name', 'queue_name', 'lock', 'queueing_lock']
     readonly_fields = ['id', 'task_name', 'queue_name', 'priority', 'lock', 'queueing_lock', 'args', 'status',
@@ -421,6 +426,11 @@ class ProcrastinateJobAdmin(admin.ModelAdmin):
             return format_html('<a href="{}">Worker {}</a>', url, obj.worker_id)
         return '-'
     worker_link.short_description = 'Worker'
+
+    def events_link(self, obj):
+        url = reverse('admin:trading_procrastinateevent_changelist') + f'?job__id__exact={obj.id}'
+        return format_html('<a class="button" href="{}">Events</a>', url)
+    events_link.short_description = 'Events'
 
 
 @admin.register(ProcrastinateEvent)
