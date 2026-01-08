@@ -1511,6 +1511,7 @@ class BotRunner:
             await asyncio.sleep(0.5)  # Give TWS time to push snapshots
 
             # Main cycle loop
+            preflight_blocked_attempts = 0
             while not self.should_stop and await self.check_bot_status():
                 self.reset_cycle_state()
 
@@ -1793,11 +1794,27 @@ class BotRunner:
                     await self.log_event('PREFLIGHT_BLOCKED', 'ERROR',
                                        f"Cycle start blocked: {len(positions)} positions, {len(open_orders)} orders found")
 
+                    preflight_blocked_attempts += 1
+                    if preflight_blocked_attempts >= 18:  # ~3 minutes at 10s intervals
+                        print("\n[PREFLIGHT] Too many blocked attempts; marking bot ERROR to avoid infinite loop.")
+                        await self.log_event('PREFLIGHT_STUCK', 'CRITICAL',
+                                           f"Cycle start blocked {preflight_blocked_attempts} times; forcing ERROR")
+
+                        @sync_to_async
+                        def mark_error():
+                            self.bot.status = 'ERROR'
+                            self.bot.stopped_at = datetime.now(timezone.utc)
+                            self.bot.save()
+                        await mark_error()
+                        self.should_stop = True
+                        break
+
                     print("\n[PREFLIGHT] Waiting 10 seconds before retrying preflight check...")
                     await asyncio.sleep(10)
                     continue  # Skip to next iteration, retry preflight check
 
                 print("[PREFLIGHT] Check passed - no positions or orders found")
+                preflight_blocked_attempts = 0
 
                 # Get next cycle number and create cycle atomically
                 @sync_to_async
