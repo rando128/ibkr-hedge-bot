@@ -202,6 +202,7 @@ class Order(models.Model):
     status = models.CharField(max_length=20, choices=STATUS_CHOICES, default='PendingSubmit', db_index=True)
     filled_quantity = models.DecimalField(max_digits=10, decimal_places=2, default=0)
     avg_fill_price = models.DecimalField(max_digits=15, decimal_places=4, null=True, blank=True)
+    total_commission = models.DecimalField(max_digits=10, decimal_places=2, default=0, help_text="Sum of all execution commissions")
 
     # Timestamps
     submitted_at = models.DateTimeField(default=timezone.now)
@@ -220,6 +221,11 @@ class Order(models.Model):
 
     def __str__(self):
         return f"Order {self.order_id}: {self.role} {self.action} {self.total_quantity} ({self.status})"
+
+    def update_commission(self):
+        """Recalculate total commission from executions"""
+        self.total_commission = sum(e.commission for e in self.executions.all())
+        self.save(update_fields=['total_commission'])
 
 
 class Execution(models.Model):

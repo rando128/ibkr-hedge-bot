@@ -251,6 +251,7 @@ class BotRunner:
                 order_locked.filled_quantity += shares
                 order_locked.status = 'Filled' if order_locked.filled_quantity >= order_locked.total_quantity else 'PartiallyFilled'
                 order_locked.avg_fill_price = avg_price
+                order_locked.update_commission()  # Update aggregated commission from executions
                 if getattr(exec_report, 'permId', None):
                     order_locked.perm_id = getattr(exec_report, 'permId')
                 if order_locked.status == 'Filled':
@@ -870,6 +871,9 @@ class BotRunner:
                     execution.commission_currency = report.currency or 'USD'
                     execution.save()
 
+                    # Update order commission
+                    execution.order.update_commission()
+
                     # Update cycle P&L (lookup from execution, works even after cycle completes)
                     with transaction.atomic():
                         cycle = Cycle.objects.select_for_update().get(pk=execution.cycle_id)
@@ -1281,6 +1285,7 @@ class BotRunner:
                     if db_order.status == 'Filled':
                         db_order.filled_at = exec_time
                     db_order.save()
+                    db_order.update_commission()  # Update aggregated commission from executions
 
                     # Update Cycle P&L
                     cycle = Cycle.objects.select_for_update().get(pk=self.cycle.pk)
