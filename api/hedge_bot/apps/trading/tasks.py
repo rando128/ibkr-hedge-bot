@@ -227,8 +227,10 @@ async def run_bot_worker(bot_id: int, task_id: str = None):
         from .bot_runner import BotRunner
 
         # Create and run the bot
+        logger.info(f"[WORKER] bot={bot_id} claim ok, launching runner (task_id={task_id})")
         runner = BotRunner(bot_id=bot_id)
         await runner.run()
+        logger.info(f"[WORKER] bot={bot_id} runner finished (task_id={task_id})")
 
     except Exception as e:
         tb_str = traceback.format_exc()
