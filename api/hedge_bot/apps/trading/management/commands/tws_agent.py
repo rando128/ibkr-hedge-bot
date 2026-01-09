@@ -499,6 +499,20 @@ class Command(BaseCommand):
                 cycle = load_or_create_cycle(bot)
 
             if not cycle:
+                # If we're STOPPING and fully flat/clean, mark STOPPED
+                if bot.status == "STOPPING":
+                    request_snapshots()
+                    long_pos = get_position_qty(contract.conId, bot.long_account)
+                    short_pos = get_position_qty(contract.conId, bot.short_account)
+                    open_trades_for_bot = [
+                        t for t in ib.openTrades()
+                        if t.contract.conId == contract.conId and t.order.account in (bot.long_account, bot.short_account)
+                    ]
+                    if long_pos == 0 and short_pos == 0 and not open_trades_for_bot:
+                        bot.status = "STOPPED"
+                        bot.stopped_at = timezone.now()
+                        bot.save(update_fields=["status", "stopped_at"])
+                        log_event(level="INFO", event_type="BOT_STOPPED", message="Bot stopped (no active cycle; flat/clean)", bot=bot)
                 return
 
             # Safety timer: only applies in hedge activation states.
@@ -567,6 +581,12 @@ class Command(BaseCommand):
                     cycle.save(update_fields=["completed_at"])
                     log_event(level="INFO", event_type="CYCLE_COMPLETE", message="Cycle aborted/cleaned", bot=bot, cycle=cycle)
                     cycle = None
+                    if bot.status == "STOPPING":
+                        bot.status = "STOPPED"
+                        bot.stopped_at = timezone.now()
+                        bot.save(update_fields=["status", "stopped_at"])
+                        log_event(level="INFO", event_type="BOT_STOPPED", message="Bot stopped after cycle cleanup", bot=bot)
+                        return
                     # Will create a fresh cycle below if bot remains RUNNING
 
             if not cycle and bot.status == "RUNNING":
