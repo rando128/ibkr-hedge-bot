@@ -872,7 +872,11 @@ class Command(BaseCommand):
 
         def _process_exec_details(trade, fill):
             # We only react in real-time to stop-loss fills (SL -> trailing flip).
-            order_ref = getattr(trade.order, "orderRef", "") if trade else ""
+            order_ref = ""
+            if trade and getattr(trade, "order", None):
+                order_ref = getattr(trade.order, "orderRef", "") or ""
+            if not order_ref and fill and getattr(fill, "execution", None):
+                order_ref = getattr(fill.execution, "orderRef", "") or ""
             parsed = parse_order_ref(order_ref)
             if not parsed:
                 return
