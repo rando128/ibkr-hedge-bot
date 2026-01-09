@@ -190,26 +190,51 @@ class Command(BaseCommand):
             from ib_insync import ExecutionFilter
 
             prefix = f"{ORDERREF_PREFIX}:{bot.id}:{cycle.cycle_key}:"
-            filt = ExecutionFilter()
-            filt.clientId = client_id
-            # Limit to executions since cycle start to reduce noise
-            try:
-                filt.time = cycle.started_at.astimezone(timezone.utc).strftime("%Y%m%d-%H:%M:%S")
-            except Exception:
-                pass
-            executions = ib.reqExecutions(filt)
+
+            def fetch_execs(with_filter: bool):
+                if not with_filter:
+                    return ib.reqExecutions()
+                filt = ExecutionFilter()
+                filt.clientId = client_id
+                try:
+                    filt.time = cycle.started_at.astimezone(timezone.utc).strftime("%Y%m%d-%H:%M:%S")
+                except Exception:
+                    pass
+                executions: list = []
+                for acct in {bot.long_account, bot.short_account}:
+                    if not acct:
+                        continue
+                    filt.acctCode = acct
+                    try:
+                        executions.extend(ib.reqExecutions(filt))
+                    except Exception:
+                        continue
+                return executions
+
+            executions = fetch_execs(with_filter=True)
+            if not executions:
+                executions = fetch_execs(with_filter=False)
             total_buys = Decimal("0")
             total_sells = Decimal("0")
             total_commission = Decimal("0")
             matched = 0
             for ex in executions:
-                if not getattr(ex, "orderRef", "") or not getattr(ex, "price", None):
+                order_ref = str(getattr(ex, "orderRef", "") or "")
+                price = getattr(ex, "price", None)
+                if not order_ref or price is None:
                     continue
-                if not str(ex.orderRef).startswith(prefix):
+                parsed = parse_order_ref(order_ref)
+                if not parsed or parsed.bot_id != bot.id:
+                    continue
+                if parsed.cycle_key != str(cycle.cycle_key):
+                    continue
+                role = parsed.role.upper()
+                # Accept only known roles
+                if role not in {"LONG_ENTRY", "SHORT_ENTRY", "LONG_SL", "SHORT_SL", "LONG_TRAIL", "SHORT_TRAIL", "PANIC_DUP073404", "PANIC_DUP073403"}:
                     continue
                 matched += 1
                 qty = Decimal(str(ex.shares or 0))
-                px = Decimal(str(ex.price))
+                px = Decimal(str(price))
                 side = str(ex.side).upper()
                 if side in {"BOT", "BUY"}:
                     total_buys += qty * px
