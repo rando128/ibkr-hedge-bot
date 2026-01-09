@@ -11,6 +11,7 @@ from django.core.management.base import BaseCommand
 from django.db import transaction
 from django.db.models import Max
 from django.utils import timezone
+from django.utils.asyncio import async_unsafe
 
 from hedge_bot.apps.trading.models import Bot, Cycle, Event
 
@@ -699,6 +700,7 @@ class Command(BaseCommand):
                 connectivity_down = False
             logger.warning("IB error code=%s reqId=%s msg=%s", errorCode, reqId, errorString)
 
+        @async_unsafe
         def on_exec_details(trade, fill):
             # We only react in real-time to stop-loss fills (SL -> trailing flip).
             try:
