@@ -595,9 +595,6 @@ class Command(BaseCommand):
             if not cycle:
                 return
 
-            if cycle.state not in {"COMPLETED", "ABORTED", "PANIC", "ERROR", "RECOVERING"}:
-                transition_cycle(cycle, "RECOVERING", "Agent reconcile: entering RECOVERING")
-
             if cycle.state == "INITIALIZING":
                 transition_cycle(cycle, "ENTERING", "Starting entries + protection")
                 place_entries(bot, cycle, contract)
