@@ -75,7 +75,8 @@ poetry run python manage.py procrastinate worker --queues monitor
 
 # Bot queue (long jobs). Adjust concurrency to number of bots you want in parallel.
 poetry run python manage.py procrastinate worker --queues bots --concurrency 5
-```
+PROCRASTINATE_LOG_LEVEL=DEBUG poetry run python manage.py procrastinate worker --queues bots --concurrency 5   2>&1  | tee bots_worker.log
+ ```
 
 Notes:
 - Without a `monitor` worker, monitor tasks will queue up while bot workers are busy.
