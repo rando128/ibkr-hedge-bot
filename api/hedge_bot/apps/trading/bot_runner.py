@@ -148,6 +148,8 @@ class BotRunner:
             self.bot.save(update_fields=['worker_last_heartbeat'])
 
         await update_heartbeat()
+        cycle_info = f"cycle={self.cycle.cycle_number}" if self.cycle else "cycle=none"
+        print(f"[HEARTBEAT] bot={self.bot.id} {cycle_info} task_id={getattr(self, 'client_id', None)}")
 
     async def ensure_connection(self):
         """Ensure IB connection is alive; attempt reconnection and rehydration on failure."""
@@ -1934,6 +1936,7 @@ class BotRunner:
         from ib_insync import MarketOrder, StopOrder, Order as IBOrder, TagValue
 
         try:
+            print(f"[CYCLE] Entering cycle {cycle_number} for bot {self.bot.id}")
             # Update cycle status
             @sync_to_async
             def update_cycle_status(status):
@@ -2162,6 +2165,8 @@ class BotRunner:
 
             # 5. MONITOR POSITIONS UNTIL FLAT
             print("\nMonitoring positions until flat...")
+            import time as _time
+            last_monitor_log = 0
             while True:
                 if not await self.check_bot_status():
                     await self.log_event('CYCLE_ABORTED', 'WARNING', "Bot stop detected during monitoring")
@@ -2178,6 +2183,14 @@ class BotRunner:
 
                 if not pos or all(p.position == 0 for p in pos):
                     break
+
+                # Breadcrumb every ~30s so we can see progress if stuck
+                if _time.time() - last_monitor_log > 30:
+                    last_monitor_log = _time.time()
+                    summaries = [f"{p.account}:{p.position}" for p in pos]
+                    long_status = self.active_trades.get('long').orderStatus.status if self.active_trades.get('long') else 'n/a'
+                    short_status = self.active_trades.get('short').orderStatus.status if self.active_trades.get('short') else 'n/a'
+                    print(f"[MONITOR] Positions {summaries}, orders long={long_status}, short={short_status}")
 
             print("\n>>> ALL POSITIONS CLOSED.")
             await self.log_event('POSITIONS_FLAT', 'INFO', "All positions closed")
@@ -2257,3 +2270,8 @@ class BotRunner:
             while any(not t.isDone() for t in orphans) and asyncio.get_event_loop().time() < deadline:
                 await asyncio.sleep(0.5)
                 self.ib.waitOnUpdate()
+            remaining = [t.order.orderId for t in orphans if not t.isDone()]
+            if remaining:
+                print(f"[CLEANUP] ⚠ Still open after cancel wait: {remaining}")
+            else:
+                print("[CLEANUP] All orphan orders cancelled")
