@@ -848,7 +848,11 @@ class Command(BaseCommand):
             if cycle.state == "TRAILING":
                 # Completion condition: both accounts flat and no open orders for this cycle.
                 cycle_trades = open_trades_for_cycle(contract_conid, bot, cycle)
-                if long_pos == 0 and short_pos == 0 and not cycle_trades:
+                if long_pos == 0 and short_pos == 0:
+                    if cycle_trades:
+                        # Clean up any straggling orders tied to this cycle.
+                        for t in cycle_trades:
+                            with_retries(lambda t=t: ib.cancelOrder(t.order), action=f"cancel stray order {t.order.orderId}")
                     transition_cycle(cycle, "PNL_CALCULATION", "Positions flat; calculating P&L")
                 return
 
