@@ -45,8 +45,11 @@ def request_stop_bot(bot_id: int):
 @app.task(queue="monitor")
 def request_panic_bot(bot_id: int):
     bot = Bot.objects.get(pk=bot_id)
+    if bot.status == "RUNNING":
+        bot.status = "STOPPING"
+        bot.stopped_at = timezone.now()
     bot.panic_requested = True
-    bot.save(update_fields=["panic_requested"])
+    bot.save(update_fields=["status", "stopped_at", "panic_requested"])
     Event.objects.create(bot=bot, level="CRITICAL", event_type="PANIC_REQUESTED", message="PANIC requested (task)")
 
 
@@ -63,4 +66,3 @@ def reconcile_running_bots(timestamp: int):
     running = Bot.objects.filter(status__in=("RUNNING", "STOPPING")).count()
     if running:
         logger.debug("reconcile_running_bots tick: %s running/stopping bots", running)
-
