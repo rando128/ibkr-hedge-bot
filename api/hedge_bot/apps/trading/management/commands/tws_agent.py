@@ -682,6 +682,25 @@ class Command(BaseCommand):
             long_pos = get_position_qty(contract_conid, bot.long_account)
             short_pos = get_position_qty(contract_conid, bot.short_account)
 
+            # If STOPPING and fully flat/clean, mark STOPPED (even if a cycle exists).
+            if bot.status == "STOPPING":
+                open_trades_for_bot = [
+                    t
+                    for t in ib.openTrades()
+                    if t.contract.conId == contract_conid and t.order.account in (bot.long_account, bot.short_account)
+                ]
+                if long_pos == 0 and short_pos == 0 and not open_trades_for_bot:
+                    if cycle and cycle.state not in ("COMPLETED", "ABORTED"):
+                        transition_cycle(cycle, "ABORTED", "Bot stopping: flat/clean; closing cycle", level="WARNING")
+                        cycle.completed_at = timezone.now()
+                        cycle.save(update_fields=["completed_at"])
+                        log_event(level="INFO", event_type="CYCLE_COMPLETE", message="Cycle aborted/cleaned", bot=bot, cycle=cycle)
+                    bot.status = "STOPPED"
+                    bot.stopped_at = timezone.now()
+                    bot.save(update_fields=["status", "stopped_at"])
+                    log_event(level="INFO", event_type="BOT_STOPPED", message="Bot stopped (flat/clean during STOPPING)", bot=bot, cycle=cycle)
+                    return
+
             long_sl = find_open_trade_by_role(contract_conid, bot, cycle, "LONG_SL")
             short_sl = find_open_trade_by_role(contract_conid, bot, cycle, "SHORT_SL")
             long_trail = find_open_trade_by_role(contract_conid, bot, cycle, "LONG_TRAIL")
