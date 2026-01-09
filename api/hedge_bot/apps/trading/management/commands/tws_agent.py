@@ -187,16 +187,27 @@ class Command(BaseCommand):
             ib.sleep(0.5)
 
         def finalize_pnl(bot: Bot, cycle: Cycle):
+            from ib_insync import ExecutionFilter
+
             prefix = f"{ORDERREF_PREFIX}:{bot.id}:{cycle.cycle_key}:"
-            executions = ib.reqExecutions()
+            filt = ExecutionFilter()
+            filt.clientId = client_id
+            # Limit to executions since cycle start to reduce noise
+            try:
+                filt.time = cycle.started_at.astimezone(timezone.utc).strftime("%Y%m%d-%H:%M:%S")
+            except Exception:
+                pass
+            executions = ib.reqExecutions(filt)
             total_buys = Decimal("0")
             total_sells = Decimal("0")
             total_commission = Decimal("0")
+            matched = 0
             for ex in executions:
                 if not getattr(ex, "orderRef", "") or not getattr(ex, "price", None):
                     continue
                 if not str(ex.orderRef).startswith(prefix):
                     continue
+                matched += 1
                 qty = Decimal(str(ex.shares or 0))
                 px = Decimal(str(ex.price))
                 side = str(ex.side).upper()
@@ -227,8 +238,17 @@ class Command(BaseCommand):
                     "total_sells": str(total_sells),
                     "commission": str(total_commission),
                     "net_pnl": str(net_pnl),
+                    "executions": matched,
                 },
             )
+            if matched == 0:
+                log_event(
+                    level="WARNING",
+                    event_type="PNL_MISSING_EXECUTIONS",
+                    message="No executions matched orderRef prefix during PnL calculation",
+                    bot=bot,
+                    cycle=cycle,
+                )
             if bot.status == "STOPPING":
                 bot.status = "STOPPED"
                 bot.stopped_at = timezone.now()
@@ -619,8 +639,8 @@ class Command(BaseCommand):
                     log_event(level="ERROR", event_type="BOT_ERROR", message=str(exc), bot=bot, cycle=cycle)
                 return
 
-            # Recovery: hedge imbalance (one leg missing) outside trailing state -> panic/flatten
-            if cycle.state in {"INITIALIZING", "ENTERING", "ACTIVE"}:
+            # Recovery: hedge imbalance (one leg missing) during hedge activation -> panic/flatten
+            if cycle.state in {"INITIALIZING", "ENTERING"}:
                 if (long_pos == 0) != (short_pos == 0):
                     transition_cycle(cycle, "PANIC", "Hedge imbalance detected (one leg missing); panic/flatten", level="CRITICAL")
                     panic_flatten(bot, cycle, contract)
@@ -664,6 +684,13 @@ class Command(BaseCommand):
                 return
 
             if cycle.state == "ACTIVE":
+                # If one leg vanished, treat it like an SL fill and flip to trailing instead of panicking.
+                if (long_pos == 0) != (short_pos == 0):
+                    surviving = "LONG" if long_pos > 0 else "SHORT"
+                    transition_cycle(cycle, "TRANSITIONING", "Hedge leg missing; flipping surviving leg to trailing")
+                    cancel_remaining_sl_and_trail(bot, cycle, contract, sl_role="SHORT_SL" if surviving == "LONG" else "LONG_SL", min_tick=min_tick)
+                    transition_cycle(cycle, "TRAILING", "Trailing active after imbalance flip")
+                    return
                 # Keep SL qty aligned to positions (partial fills)
                 ensure_sl_orders(bot, cycle, contract, min_tick=min_tick)
                 return
