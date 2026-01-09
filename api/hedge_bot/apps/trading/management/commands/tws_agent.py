@@ -745,9 +745,22 @@ class Command(BaseCommand):
             # Recovery: hedge imbalance (one leg missing) during hedge activation -> panic/flatten
             if cycle.state in {"INITIALIZING", "ENTERING"}:
                 if (long_pos == 0) != (short_pos == 0):
-                    transition_cycle(cycle, "PANIC", "Hedge imbalance detected (one leg missing); panic/flatten", level="CRITICAL")
-                    panic_flatten(bot, cycle, contract)
-                    return
+                    missing_side = "LONG" if long_pos == 0 else "SHORT"
+                    pending_entry = find_open_trade_by_role(
+                        contract_conid, bot, cycle, f"{missing_side}_ENTRY"
+                    )
+                    if pending_entry:
+                        log_event(
+                            level="DEBUG",
+                            event_type="IMBALANCE_PENDING_ENTRY",
+                            message=f"Hedge imbalance but pending {missing_side}_ENTRY; skipping panic",
+                            bot=bot,
+                            cycle=cycle,
+                        )
+                    else:
+                        transition_cycle(cycle, "PANIC", "Hedge imbalance detected (one leg missing); panic/flatten", level="CRITICAL")
+                        panic_flatten(bot, cycle, contract)
+                        return
 
             # If previous panic/aborted/error cycle is flat and clean, close it so a new cycle can start
             if cycle.state in {"PANIC", "ABORTED", "ERROR"}:
