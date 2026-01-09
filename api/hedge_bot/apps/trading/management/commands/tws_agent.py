@@ -700,54 +700,56 @@ class Command(BaseCommand):
                 connectivity_down = False
             logger.warning("IB error code=%s reqId=%s msg=%s", errorCode, reqId, errorString)
 
-        @async_unsafe
-        def on_exec_details(trade, fill):
+        def _process_exec_details(trade, fill):
             # We only react in real-time to stop-loss fills (SL -> trailing flip).
-            try:
-                order_ref = getattr(trade.order, "orderRef", "") if trade else ""
-                parsed = parse_order_ref(order_ref)
-                if not parsed:
-                    return
-                if parsed.role.endswith("_ENTRY"):
-                    bot = Bot.objects.filter(pk=parsed.bot_id).first()
-                    if not bot:
-                        return
-                    cycle = bot.cycles.filter(cycle_key=parsed.cycle_key).first()
-                    if not cycle or cycle.state in ("PANIC", "COMPLETED", "ABORTED"):
-                        return
-                    contract = trade.contract
-                    details = ib.reqContractDetails(contract)
-                    min_tick = float(details[0].minTick) if details else 0.01
-                    ensure_sl_orders(bot, cycle, contract, min_tick=min_tick)
-                    request_snapshots()
-                    long_pos = get_position_qty(contract.conId, bot.long_account)
-                    short_pos = get_position_qty(contract.conId, bot.short_account)
-                    long_sl = find_open_trade_by_role(contract.conId, bot, cycle, "LONG_SL")
-                    short_sl = find_open_trade_by_role(contract.conId, bot, cycle, "SHORT_SL")
-                    if cycle.state in ("INITIALIZING", "ENTERING") and long_pos > 0 and short_pos < 0 and long_sl and short_sl:
-                        transition_cycle(cycle, "ACTIVE", "Both SL protections confirmed after entry fill")
-                    return
-
-                if not parsed.role.endswith("_SL"):
-                    return
-
+            order_ref = getattr(trade.order, "orderRef", "") if trade else ""
+            parsed = parse_order_ref(order_ref)
+            if not parsed:
+                return
+            if parsed.role.endswith("_ENTRY"):
                 bot = Bot.objects.filter(pk=parsed.bot_id).first()
                 if not bot:
                     return
                 cycle = bot.cycles.filter(cycle_key=parsed.cycle_key).first()
-                if not cycle:
+                if not cycle or cycle.state in ("PANIC", "COMPLETED", "ABORTED"):
                     return
-
-                if cycle.state in ("PANIC", "COMPLETED", "ABORTED"):
-                    return
-
                 contract = trade.contract
                 details = ib.reqContractDetails(contract)
                 min_tick = float(details[0].minTick) if details else 0.01
+                ensure_sl_orders(bot, cycle, contract, min_tick=min_tick)
+                request_snapshots()
+                long_pos = get_position_qty(contract.conId, bot.long_account)
+                short_pos = get_position_qty(contract.conId, bot.short_account)
+                long_sl = find_open_trade_by_role(contract.conId, bot, cycle, "LONG_SL")
+                short_sl = find_open_trade_by_role(contract.conId, bot, cycle, "SHORT_SL")
+                if cycle.state in ("INITIALIZING", "ENTERING") and long_pos > 0 and short_pos < 0 and long_sl and short_sl:
+                    transition_cycle(cycle, "ACTIVE", "Both SL protections confirmed after entry fill")
+                return
 
-                transition_cycle(cycle, "TRANSITIONING", f"{parsed.role} filled -> flip to trailing", level="WARNING")
-                cancel_remaining_sl_and_trail(bot, cycle, contract, sl_role=parsed.role, min_tick=min_tick)
-                transition_cycle(cycle, "TRAILING", "Trailing active after SL fill")
+            if not parsed.role.endswith("_SL"):
+                return
+
+            bot = Bot.objects.filter(pk=parsed.bot_id).first()
+            if not bot:
+                return
+            cycle = bot.cycles.filter(cycle_key=parsed.cycle_key).first()
+            if not cycle:
+                return
+
+            if cycle.state in ("PANIC", "COMPLETED", "ABORTED"):
+                return
+
+            contract = trade.contract
+            details = ib.reqContractDetails(contract)
+            min_tick = float(details[0].minTick) if details else 0.01
+
+            transition_cycle(cycle, "TRANSITIONING", f"{parsed.role} filled -> flip to trailing", level="WARNING")
+            cancel_remaining_sl_and_trail(bot, cycle, contract, sl_role=parsed.role, min_tick=min_tick)
+            transition_cycle(cycle, "TRAILING", "Trailing active after SL fill")
+
+        def on_exec_details(trade, fill):
+            try:
+                threading.Thread(target=_process_exec_details, args=(trade, fill), daemon=True).start()
             except Exception as exc:
                 logger.exception("on_exec_details failed: %s", exc)
 
