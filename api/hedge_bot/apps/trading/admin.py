@@ -23,6 +23,7 @@ class BotAdmin(admin.ModelAdmin):
         "environment_badge",
         "status_badge",
         "last_cycle_state",
+        "cycles_button",
         "action_buttons",
         "log_button",
     ]
@@ -108,6 +109,12 @@ class BotAdmin(admin.ModelAdmin):
         return format_html('<a class="button" href="{}">Logs</a>', url)
 
     log_button.short_description = "Logs"
+
+    def cycles_button(self, obj: Bot):
+        url = reverse("admin:trading_cycle_changelist") + f"?bot__id__exact={obj.id}"
+        return format_html('<a class="button" href="{}">Cycles</a>', url)
+
+    cycles_button.short_description = "Cycles"
 
     def action_start_bots(self, request, queryset):
         count = 0
@@ -220,7 +227,7 @@ class BotAdmin(admin.ModelAdmin):
 @admin.register(Cycle)
 class CycleAdmin(admin.ModelAdmin):
     list_display = ["id", "bot", "cycle_number", "symbol", "state", "started_at", "last_activity_at", "net_pnl"]
-    list_filter = ["state", "symbol", "started_at"]
+    list_filter = ["bot", "state", "symbol", "started_at"]
     search_fields = ["symbol", "bot__symbol", "bot__name", "cycle_key"]
     readonly_fields = ["cycle_key", "started_at", "last_activity_at", "completed_at", "total_buys", "total_sells", "total_commission", "net_pnl"]
 
