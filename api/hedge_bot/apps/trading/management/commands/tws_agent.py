@@ -184,6 +184,55 @@ class Command(BaseCommand):
             ib.reqAllOpenOrders()
             ib.sleep(0.5)
 
+        def finalize_pnl(bot: Bot, cycle: Cycle):
+            prefix = f"{ORDERREF_PREFIX}:{bot.id}:{cycle.cycle_key}:"
+            executions = ib.reqExecutions()
+            total_buys = Decimal("0")
+            total_sells = Decimal("0")
+            total_commission = Decimal("0")
+            for ex in executions:
+                if not getattr(ex, "orderRef", "") or not getattr(ex, "price", None):
+                    continue
+                if not str(ex.orderRef).startswith(prefix):
+                    continue
+                qty = Decimal(str(ex.shares or 0))
+                px = Decimal(str(ex.price))
+                side = str(ex.side).upper()
+                if side in {"BOT", "BUY"}:
+                    total_buys += qty * px
+                else:
+                    total_sells += qty * px
+                commission = getattr(ex, "commission", None)
+                if commission is not None:
+                    total_commission += Decimal(str(commission))
+            net_pnl = total_sells - total_buys - total_commission
+            cycle.total_buys = total_buys
+            cycle.total_sells = total_sells
+            cycle.total_commission = total_commission
+            cycle.net_pnl = net_pnl
+            cycle.completed_at = timezone.now()
+            cycle.save(
+                update_fields=["total_buys", "total_sells", "total_commission", "net_pnl", "completed_at", "state", "last_activity_at"]
+            )
+            log_event(
+                level="INFO",
+                event_type="CYCLE_COMPLETE",
+                message=f"Cycle completed (PnL={net_pnl})",
+                bot=bot,
+                cycle=cycle,
+                data={
+                    "total_buys": str(total_buys),
+                    "total_sells": str(total_sells),
+                    "commission": str(total_commission),
+                    "net_pnl": str(net_pnl),
+                },
+            )
+            if bot.status == "STOPPING":
+                bot.status = "STOPPED"
+                bot.stopped_at = timezone.now()
+                bot.save(update_fields=["status", "stopped_at"])
+                log_event(level="INFO", event_type="BOT_STOPPED", message="Bot stopped after cycle completion", bot=bot, cycle=cycle)
+
         def mark_cycles_recovering():
             """On agent start, mark in-flight cycles as RECOVERING for fresh reconciliation."""
             candidates = Cycle.objects.filter(
@@ -441,7 +490,10 @@ class Command(BaseCommand):
                 if qty == 0:
                     continue
                 action = "SELL" if qty > 0 else "BUY"
-                with_retries(lambda: ib.placeOrder(contract, MarketOrder(action, float(abs(qty)), account=account)), action=f"flatten {account}")
+                order_ref = build_order_ref(bot.id, str(cycle.cycle_key) if cycle else "panic", f"PANIC_{account}")
+                order = MarketOrder(action, float(abs(qty)), account=account, tif="GTC")
+                order.orderRef = order_ref
+                with_retries(lambda o=order: ib.placeOrder(contract, o), action=f"flatten {account}")
 
             log_event(
                 level="CRITICAL",
@@ -566,7 +618,7 @@ class Command(BaseCommand):
                 return
 
             # Recovery: hedge imbalance (one leg missing) outside trailing state -> panic/flatten
-            if cycle.state in {"INITIALIZING", "ENTERING", "ACTIVE", "TRANSITIONING"}:
+            if cycle.state in {"INITIALIZING", "ENTERING", "ACTIVE"}:
                 if (long_pos == 0) != (short_pos == 0):
                     transition_cycle(cycle, "PANIC", "Hedge imbalance detected (one leg missing); panic/flatten", level="CRITICAL")
                     panic_flatten(bot, cycle, contract)
@@ -612,9 +664,18 @@ class Command(BaseCommand):
                 return
 
             if cycle.state == "TRANSITIONING":
-                # Either trailing exists or we retry on next tick.
                 if long_trail or short_trail:
                     transition_cycle(cycle, "TRAILING", "Trailing active")
+                    return
+                # No trailing yet; try to place based on surviving leg.
+                surviving = None
+                if long_pos > 0 and short_pos == 0:
+                    surviving = "LONG"
+                elif short_pos < 0 and long_pos == 0:
+                    surviving = "SHORT"
+                if surviving:
+                    place_trailing(bot, cycle, contract, surviving_role=surviving, min_tick=min_tick)
+                    transition_cycle(cycle, "TRAILING", "Trailing placed from TRANSITIONING")
                 return
 
             if cycle.state == "TRAILING":
@@ -625,16 +686,9 @@ class Command(BaseCommand):
                 return
 
             if cycle.state == "PNL_CALCULATION":
-                # Placeholder: rely on IB executions when available.
-                transition_cycle(cycle, "COMPLETED", "Cycle completed (PNL calculation placeholder)")
-                cycle.completed_at = timezone.now()
-                cycle.save(update_fields=["completed_at"])
-                log_event(level="INFO", event_type="CYCLE_COMPLETE", message="Cycle completed", bot=bot, cycle=cycle)
-                if bot.status == "STOPPING":
-                    bot.status = "STOPPED"
-                    bot.stopped_at = timezone.now()
-                    bot.save(update_fields=["status", "stopped_at"])
-                    log_event(level="INFO", event_type="BOT_STOPPED", message="Bot stopped after cycle completion", bot=bot, cycle=cycle)
+                transition_cycle(cycle, "PNL_CALCULATION", "Calculating realized P&L")
+                finalize_pnl(bot, cycle)
+                transition_cycle(cycle, "COMPLETED", "Cycle completed (PnL calculated)")
                 return
 
         def on_error(reqId, errorCode, errorString, contract):
@@ -703,26 +757,34 @@ class Command(BaseCommand):
         mark_cycles_recovering()
         request_snapshots()
 
-        last_reconcile = 0.0
+        last_reconcile_by_bot: dict[int, float] = {}
 
         try:
             while True:
                 # Process IB messages + run DB polling.
                 ib.sleep(poll_interval)
 
-                # Minimal resilience: if connectivity is down, avoid aggressive actions and just keep looping.
                 now = time.time()
-                if now - last_reconcile >= reconcile_interval:
-                    last_reconcile = now
-                    bots = Bot.objects.filter(environment=environment, status__in=("RUNNING", "STOPPING", "ERROR")).order_by("id")
-                    for bot in bots:
-                        try:
-                            reconcile_bot(bot)
-                        except Exception as exc:
-                            logger.exception("reconcile_bot failed for bot=%s: %s", bot.id, exc)
-                            bot.last_error = str(exc)
-                            bot.status = "ERROR"
-                            bot.save(update_fields=["last_error", "status"])
-                            log_event(level="ERROR", event_type="BOT_ERROR", message=str(exc), bot=bot)
+                bots = Bot.objects.filter(environment=environment, status__in=("RUNNING", "STOPPING", "ERROR")).order_by("id")
+                active_ids = set()
+                for bot in bots:
+                    active_ids.add(bot.id)
+                    last_run = last_reconcile_by_bot.get(bot.id, 0.0)
+                    if now - last_run < reconcile_interval and last_run > 0:
+                        continue
+                    try:
+                        reconcile_bot(bot)
+                    except Exception as exc:
+                        logger.exception("reconcile_bot failed for bot=%s: %s", bot.id, exc)
+                        bot.last_error = str(exc)
+                        bot.status = "ERROR"
+                        bot.save(update_fields=["last_error", "status"])
+                        log_event(level="ERROR", event_type="BOT_ERROR", message=str(exc), bot=bot)
+                    finally:
+                        last_reconcile_by_bot[bot.id] = now
+                # Prune stale entries
+                for bid in list(last_reconcile_by_bot.keys()):
+                    if bid not in active_ids:
+                        last_reconcile_by_bot.pop(bid, None)
         finally:
             ib.disconnect()
