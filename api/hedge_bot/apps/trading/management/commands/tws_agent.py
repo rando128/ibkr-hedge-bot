@@ -456,6 +456,19 @@ class Command(BaseCommand):
                 panic_flatten(bot, cycle, contract)
                 bot.panic_requested = False
                 bot.save(update_fields=["panic_requested"])
+                # If we are in STOPPING, and now flat/clean, mark STOPPED
+                request_snapshots()
+                long_pos = get_position_qty(contract.conId, bot.long_account)
+                short_pos = get_position_qty(contract.conId, bot.short_account)
+                open_trades_for_bot = [
+                    t for t in ib.openTrades()
+                    if t.contract.conId == contract.conId and t.order.account in (bot.long_account, bot.short_account)
+                ]
+                if bot.status == "STOPPING" and long_pos == 0 and short_pos == 0 and not open_trades_for_bot:
+                    bot.status = "STOPPED"
+                    bot.stopped_at = timezone.now()
+                    bot.save(update_fields=["status", "stopped_at"])
+                    log_event(level="INFO", event_type="BOT_STOPPED", message="Bot stopped after panic cleanup", bot=bot, cycle=cycle)
                 return
 
             if bot.status == "STOPPED":
@@ -488,6 +501,20 @@ class Command(BaseCommand):
             short_sl = find_open_trade_by_role(contract_conid, bot, cycle, "SHORT_SL")
             long_trail = find_open_trade_by_role(contract_conid, bot, cycle, "LONG_TRAIL")
             short_trail = find_open_trade_by_role(contract_conid, bot, cycle, "SHORT_TRAIL")
+
+            # If previous panic/aborted/error cycle is flat and clean, close it so a new cycle can start
+            if cycle.state in {"PANIC", "ABORTED", "ERROR"}:
+                cycle_trades = open_trades_for_cycle(contract_conid, bot, cycle)
+                if long_pos == 0 and short_pos == 0 and not cycle_trades:
+                    transition_cycle(cycle, "ABORTED", "Cycle closed after panic/error cleanup", level="WARNING")
+                    cycle.completed_at = timezone.now()
+                    cycle.save(update_fields=["completed_at"])
+                    log_event(level="INFO", event_type="CYCLE_COMPLETE", message="Cycle aborted/cleaned", bot=bot, cycle=cycle)
+                    cycle = None
+                    # Will create a fresh cycle below if bot remains RUNNING
+
+            if not cycle and bot.status == "RUNNING":
+                cycle = load_or_create_cycle(bot)
 
             if cycle.state == "INITIALIZING":
                 transition_cycle(cycle, "ENTERING", "Starting entries + protection")
@@ -526,7 +553,9 @@ class Command(BaseCommand):
                 log_event(level="INFO", event_type="CYCLE_COMPLETE", message="Cycle completed", bot=bot, cycle=cycle)
                 if bot.status == "STOPPING":
                     bot.status = "STOPPED"
-                    bot.save(update_fields=["status"])
+                    bot.stopped_at = timezone.now()
+                    bot.save(update_fields=["status", "stopped_at"])
+                    log_event(level="INFO", event_type="BOT_STOPPED", message="Bot stopped after cycle completion", bot=bot, cycle=cycle)
                 return
 
         def on_error(reqId, errorCode, errorString, contract):
