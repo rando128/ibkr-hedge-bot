@@ -25,18 +25,16 @@ The `trading` app provides a Django-based hedge bot system that integrates with 
 
 The system consists of:
 
-- **Django Models**: Store bot configurations, cycles, orders, executions, and events
-- **Bot Runner**: Executes hedge bot trading logic with async IBKR integration
-- **Procrastinate Workers**: Background task queue for running multiple bots concurrently
-- **Django Admin**: Web interface for managing bots and viewing logs
+- **Django Models**: Store bot configurations, cycles, and events (no order/execution persistence in Option B)
+- **Always-on TWS Agent**: Management command `tws_agent` holds the IB connection, handles SL-fill → trailing flip, and reconciles state from TWS snapshots
+- **Procrastinate Tasks**: Lightweight DB-only tasks (start/stop/panic flags, periodic tick on `monitor` queue)
+- **Django Admin**: Web interface for managing bots, cycles, and logs
 
 ### Models
 
-- **Bot**: Bot configuration (symbol, accounts, trading parameters, contract settings)
-- **Cycle**: Tracks each hedge cycle with P&L calculation
-- **Order**: IBKR orders with roles (LONG_ENTRY, SHORT_SL, etc.)
-- **Execution**: Individual fills with commission tracking
-- **Event**: Comprehensive audit trail of all bot activities
+- **Bot**: Configuration (symbol, accounts, trading parameters, contract settings) and desired status (`RUNNING` / `STOPPING` / `STOPPED` / `ERROR`), plus `panic_requested`.
+- **Cycle**: One hedge cycle with persisted state (`INITIALIZING`, `ENTERING`, `ACTIVE`, `TRANSITIONING`, `TRAILING`, `RECOVERING`, `PANIC`, `PNL_CALCULATION`, `COMPLETED`, `ABORTED`, `ERROR`), P&L totals, `cycle_key` (UUID), and timestamps.
+- **Event**: Append-only audit trail (state transitions, admin actions, errors).
 
 ### Prerequisites
 
@@ -58,29 +56,25 @@ poetry run python manage.py runserver 0.0.0.0:8080
 
 Access the admin at: http://127.0.0.1:8080/back/admin/
 
-#### 2. Start Procrastinate Workers (split queues)
-
-Queues:
-- `monitor` : runs `monitor_bots` (lightweight, every minute)
-- `bots`    : runs `run_bot_worker` (long-running per-bot)
-
-Run a dedicated worker for each queue:
+#### 2. Start the TWS Agent (always-on)
 
 ```bash
-# In repo root
 cd api
+# Environment chooses default port (PAPER→7497, LIVE→7496); override with --port if needed
+poetry run python manage.py tws_agent --environment PAPER
+```
 
-# Monitor queue (small, fast jobs)
+#### 3. Start the Procrastinate Worker (monitor queue only)
+
+Queues:
+- `monitor` : runs lightweight tasks (start/stop/panic flags, periodic tick)
+
+Run worker:
+
+```bash
+cd api
 poetry run python manage.py procrastinate worker --queues monitor
-
-# Bot queue (long jobs). Adjust concurrency to number of bots you want in parallel.
-poetry run python manage.py procrastinate worker --queues bots --concurrency 5
-PROCRASTINATE_LOG_LEVEL=DEBUG poetry run python manage.py procrastinate worker --queues bots --concurrency 5   2>&1  | tee bots_worker.log
- ```
-
-Notes:
-- Without a `monitor` worker, monitor tasks will queue up while bot workers are busy.
-- You can scale the bots worker separately (e.g., run multiple `--queues bots` workers or increase `--concurrency`).
+```
 
 
 ### Managing Bots via Django Admin
@@ -113,14 +107,12 @@ Notes:
 **Option 1: From Bot List**
 1. Go to http://127.0.0.1:8080/back/admin/trading/bot/
 2. Click the **"Start"** button next to the bot
-3. The bot status will change to **RUNNING**
-4. Check the worker console for connection logs
+3. The bot status will change to **RUNNING** (the TWS agent will reconcile and start the cycle)
 
 **Option 2: From Bot Detail Page**
 1. Open the bot's detail page
 2. Change `Status` to **RUNNING**
 3. Click "Save"
-4. The periodic monitor task will launch the worker within 1 minute
 
 **Option 3: Bulk Start**
 1. Select multiple bots in the list
@@ -132,18 +124,21 @@ Notes:
 **Option 1: From Bot List**
 1. Go to http://127.0.0.1:8080/back/admin/trading/bot/
 2. Click the **"Stop"** button next to the running bot
-3. The bot will detect the status change within 1-2 seconds and gracefully shut down
+3. The bot status will change to **STOPPING** (finish current cycle, then stop)
 
 **Option 2: From Bot Detail Page**
 1. Open the bot's detail page
-2. Change `Status` to **STOPPED**
+2. Change `Status` to **STOPPING**
 3. Click "Save"
-4. The bot will stop within 1-2 seconds
 
 **Option 3: Bulk Stop**
 1. Select multiple running bots in the list
 2. Choose "Stop selected bots" from the Actions dropdown
 3. Click "Go"
+
+#### PANIC (emergency flatten)
+- From Bot list, click the 🚨 button; sets `panic_requested=True` and logs an event. The TWS agent cancels orders and flattens both accounts for that bot.
+- Bulk action: “PANIC selected bots”.
 
 #### Viewing Bot Logs
 
@@ -165,22 +160,8 @@ Notes:
 1. Go to http://127.0.0.1:8080/back/admin/trading/cycle/
 2. View cycle details including:
    - Cycle number
-   - Status (ACTIVE, COMPLETED, FAILED)
-   - Total buys, sells, commission
-   - Net P&L
-3. Click on a cycle to see associated orders and executions
-
-#### Viewing Orders and Executions
-
-**Orders:**
-- http://127.0.0.1:8080/back/admin/trading/order/
-- Shows all orders with roles (LONG_ENTRY, SHORT_SL, etc.)
-- Filter by status, role, action, order type
-
-**Executions:**
-- http://127.0.0.1:8080/back/admin/trading/execution/
-- Shows individual fills with prices and commission
-- Linked to orders and cycles
+   - State (INITIALIZING, ENTERING, ACTIVE, TRANSITIONING, TRAILING, RECOVERING, PANIC, PNL_CALCULATION, COMPLETED, ABORTED, ERROR)
+   - Total buys, sells, commission, net P&L (computed from TWS executions)
 
 ### Client ID Management
 
@@ -201,11 +182,10 @@ This ensures:
 
 #### Worker Status
 
-Check the Procrastinate worker console for:
-- Bot connections: `[CONNECTION] Connecting to TWS with clientId=...`
-- Cycle execution: `[CYCLE] Executing placeholder cycle...`
-- Stop detection: `[BOT] Stop detected - status changed to STOPPED`
-- Errors: `[ERROR]`, `[FATAL ERROR]`
+Check the TWS agent console for:
+- IB connection logs
+- SL→trailing transitions
+- Reconcile ticks and panic actions
 
 #### Django Admin Dashboard
 
@@ -221,45 +201,38 @@ The bot list shows:
 
 #### Bot won't start
 
-1. Check TWS/Gateway is running on the correct port
-2. Verify API connections are enabled in TWS settings
-3. Check worker is running with `--concurrency` flag
-4. Look for errors in worker console and Event logs
+1. Check TWS/Gateway is running on the correct port and API connections enabled.
+2. Ensure the TWS agent is running (`manage.py tws_agent`).
+3. Check admin Events for BOT_ERROR.
 
 #### Client ID already in use error
 
-This should be resolved automatically with the timestamp-based client ID system. If it persists:
-1. Restart TWS/Gateway to clear stale connections
-2. Restart the Procrastinate worker to get a fresh timestamp seed
-3. Check if there are zombie bot processes still connected
+1. Restart TWS/Gateway to clear stale connections.
+2. Restart the TWS agent with a different `--client-id` if needed.
 
 #### Bot won't stop
 
-1. Check the worker console - bot should detect status change within 1-2 seconds
-2. Verify the worker is running and processing tasks
-3. Check Event logs for stop detection messages
-4. If stuck, restart the worker (bot will be force-terminated)
+1. Ensure the TWS agent is running.
+2. Check Events for stop/panic handling and errors.
 
 #### Missing logs in admin
 
-1. Verify the bot is creating Event records (check in Django shell)
-2. Check database connection in worker
-3. Look for Django ORM errors in worker console
-4. Ensure `sync_to_async` wrappers are working correctly
+1. Verify DB connectivity.
+2. Check the TWS agent console for ORM/logging errors.
 
 ### Database Queries
 
 Useful Django ORM queries for debugging:
 
 ```python
-from hedge_bot.apps.trading.models import Bot, Cycle, Order, Execution, Event
+from hedge_bot.apps.trading.models import Bot, Cycle, Event
 
 # Get running bots
 running_bots = Bot.objects.filter(status='RUNNING')
 
 # Get latest cycle for a bot
 bot = Bot.objects.get(id=1)
-latest_cycle = bot.cycles.order_by('-created_at').first()
+latest_cycle = bot.cycles.order_by('-started_at').first()
 
 # Get all events for a bot
 events = Event.objects.filter(bot_id=1).order_by('-created_at')
@@ -267,9 +240,6 @@ events = Event.objects.filter(bot_id=1).order_by('-created_at')
 # Calculate total P&L for a bot
 from django.db.models import Sum
 total_pnl = bot.cycles.filter(status='COMPLETED').aggregate(Sum('net_pnl'))
-
-# Get failed orders
-failed_orders = Order.objects.filter(status__in=['Cancelled', 'ApiCancelled', 'Inactive'])
 ```
 
 ## OpenAPI
