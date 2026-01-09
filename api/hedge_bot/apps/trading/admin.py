@@ -141,8 +141,11 @@ class BotAdmin(admin.ModelAdmin):
     def action_panic_bots(self, request, queryset):
         count = 0
         for bot in queryset:
+            if bot.status == "RUNNING":
+                bot.status = "STOPPING"
+                bot.stopped_at = timezone.now()
             bot.panic_requested = True
-            bot.save(update_fields=["panic_requested"])
+            bot.save(update_fields=["status", "stopped_at", "panic_requested"])
             Event.objects.create(bot=bot, level="CRITICAL", event_type="PANIC_REQUESTED", message="PANIC requested (bulk)")
             count += 1
         self.message_user(request, f"{count} bot(s) panic_requested=True")
@@ -204,8 +207,11 @@ class BotAdmin(admin.ModelAdmin):
             messages.error(request, "Bot not found")
             return redirect("admin:trading_bot_changelist")
 
+        if bot.status == "RUNNING":
+            bot.status = "STOPPING"
+            bot.stopped_at = timezone.now()
         bot.panic_requested = True
-        bot.save(update_fields=["panic_requested"])
+        bot.save(update_fields=["status", "stopped_at", "panic_requested"])
         Event.objects.create(bot=bot, level="CRITICAL", event_type="PANIC_REQUESTED", message="PANIC requested from admin")
         messages.warning(request, f'PANIC requested for "{bot.name or bot.symbol}"')
         return redirect("admin:trading_bot_changelist")
@@ -225,4 +231,3 @@ class EventAdmin(admin.ModelAdmin):
     list_filter = ["level", "event_type", "created_at"]
     search_fields = ["message", "event_type", "bot__symbol", "bot__name", "cycle__symbol", "cycle__cycle_key"]
     readonly_fields = ["created_at"]
-
