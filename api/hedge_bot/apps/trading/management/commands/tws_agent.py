@@ -655,6 +655,9 @@ class Command(BaseCommand):
 
             if cycle.state == "ENTERING":
                 ensure_sl_orders(bot, cycle, contract, min_tick=min_tick)
+                # refresh SL presence after placement
+                long_sl = find_open_trade_by_role(contract_conid, bot, cycle, "LONG_SL")
+                short_sl = find_open_trade_by_role(contract_conid, bot, cycle, "SHORT_SL")
                 # When both positions exist and both SL are in place, hedge is active.
                 if long_pos > 0 and short_pos < 0 and long_sl and short_sl:
                     transition_cycle(cycle, "ACTIVE", "Both SL protections confirmed in place")
