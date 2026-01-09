@@ -82,7 +82,7 @@ class Command(BaseCommand):
         parser.add_argument("--port", type=int, default=None, help="Overrides env default (PAPER=7497, LIVE=7496)")
         parser.add_argument("--environment", choices=["PAPER", "LIVE"], default="PAPER")
         parser.add_argument("--client-id", type=int, default=7000, help="IB clientId for the agent connection")
-        parser.add_argument("--reconcile-interval", type=float, default=30.0)
+        parser.add_argument("--reconcile-interval", type=float, default=10.0)
         parser.add_argument("--poll-interval", type=float, default=0.5)
 
     def handle(self, *args, **options):
@@ -183,6 +183,15 @@ class Command(BaseCommand):
             ib.reqPositions()
             ib.reqAllOpenOrders()
             ib.sleep(0.5)
+
+        def mark_cycles_recovering():
+            """On agent start, mark in-flight cycles as RECOVERING for fresh reconciliation."""
+            candidates = Cycle.objects.filter(
+                bot__status__in=("RUNNING", "STOPPING"),
+                state__in=("INITIALIZING", "ENTERING", "ACTIVE", "TRANSITIONING", "TRAILING", "PNL_CALCULATION", "RECOVERING"),
+            )
+            for cycle in candidates:
+                transition_cycle(cycle, "RECOVERING", "Agent restart: entering RECOVERING")
 
         def open_trades_for_cycle(contract_conid: int, bot: Bot, cycle: Cycle):
             prefix = f"{ORDERREF_PREFIX}:{bot.id}:{cycle.cycle_key}:"
@@ -511,6 +520,37 @@ class Command(BaseCommand):
             long_trail = find_open_trade_by_role(contract_conid, bot, cycle, "LONG_TRAIL")
             short_trail = find_open_trade_by_role(contract_conid, bot, cycle, "SHORT_TRAIL")
 
+            if cycle.state == "RECOVERING":
+                cycle_trades = open_trades_for_cycle(contract_conid, bot, cycle)
+                # Hedge intact with SLs
+                if long_pos > 0 and short_pos < 0 and long_sl and short_sl:
+                    transition_cycle(cycle, "ACTIVE", "Recovered: hedge intact with SLs")
+                    return
+                # Already trailing
+                if long_trail or short_trail:
+                    transition_cycle(cycle, "TRAILING", "Recovered: trailing already active")
+                    return
+                # Flat and clean -> abort cycle
+                if long_pos == 0 and short_pos == 0 and not cycle_trades:
+                    transition_cycle(cycle, "ABORTED", "Recovered: flat and clean; closing cycle", level="WARNING")
+                    cycle.completed_at = timezone.now()
+                    cycle.save(update_fields=["completed_at"])
+                    log_event(level="INFO", event_type="CYCLE_COMPLETE", message="Cycle aborted/cleaned", bot=bot, cycle=cycle)
+                    return
+                # Hedge imbalance or missing protections -> panic
+                transition_cycle(cycle, "PANIC", "Recovered: hedge incomplete or protections missing; panic", level="CRITICAL")
+                try:
+                    panic_flatten(bot, cycle, contract)
+                except Exception as exc:
+                    logger.exception("panic_flatten failed during RECOVERING for bot=%s: %s", bot.id, exc)
+                    cycle.state = "ERROR"
+                    cycle.save(update_fields=["state"])
+                    bot.status = "ERROR"
+                    bot.last_error = str(exc)
+                    bot.save(update_fields=["status", "last_error"])
+                    log_event(level="ERROR", event_type="BOT_ERROR", message=str(exc), bot=bot, cycle=cycle)
+                return
+
             # Recovery: hedge imbalance (one leg missing) outside trailing state -> panic/flatten
             if cycle.state in {"INITIALIZING", "ENTERING", "ACTIVE", "TRANSITIONING"}:
                 if (long_pos == 0) != (short_pos == 0):
@@ -534,6 +574,9 @@ class Command(BaseCommand):
 
             if not cycle:
                 return
+
+            if cycle.state not in {"COMPLETED", "ABORTED", "PANIC", "ERROR", "RECOVERING"}:
+                transition_cycle(cycle, "RECOVERING", "Agent reconcile: entering RECOVERING")
 
             if cycle.state == "INITIALIZING":
                 transition_cycle(cycle, "ENTERING", "Starting entries + protection")
@@ -640,6 +683,7 @@ class Command(BaseCommand):
 
         self.stdout.write(self.style.NOTICE(f"[TWS_AGENT] Connecting to {host}:{port} (env={environment}) clientId={client_id}"))
         ib.connect(host, port, clientId=client_id, timeout=10)
+        mark_cycles_recovering()
         request_snapshots()
 
         last_reconcile = 0.0
