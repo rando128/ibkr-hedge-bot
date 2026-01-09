@@ -218,20 +218,36 @@ class Command(BaseCommand):
             total_sells = Decimal("0")
             total_commission = Decimal("0")
             matched = 0
+            inspected = 0
+            trace = []
+            skip_counts = {}
             for ex in executions:
                 order_ref = str(getattr(ex, "orderRef", "") or "")
                 price = getattr(ex, "price", None)
                 if not order_ref or price is None:
+                    skip_counts["missing_orderref_or_price"] = skip_counts.get("missing_orderref_or_price", 0) + 1
+                    trace.append({"skip": "missing_orderref_or_price"})
                     continue
                 parsed = parse_order_ref(order_ref)
-                if not parsed or parsed.bot_id != bot.id:
+                if not parsed:
+                    skip_counts["parse_failed"] = skip_counts.get("parse_failed", 0) + 1
+                    trace.append({"skip": "parse_failed", "orderRef": order_ref})
+                    continue
+                if parsed.bot_id != bot.id:
+                    skip_counts["other_bot"] = skip_counts.get("other_bot", 0) + 1
+                    trace.append({"skip": "other_bot", "orderRef": order_ref})
                     continue
                 if parsed.cycle_key != str(cycle.cycle_key):
+                    skip_counts["other_cycle"] = skip_counts.get("other_cycle", 0) + 1
+                    trace.append({"skip": "other_cycle", "orderRef": order_ref})
                     continue
                 role = parsed.role.upper()
                 # Accept only known roles
                 if role not in {"LONG_ENTRY", "SHORT_ENTRY", "LONG_SL", "SHORT_SL", "LONG_TRAIL", "SHORT_TRAIL", "PANIC_DUP073404", "PANIC_DUP073403"}:
+                    skip_counts["unknown_role"] = skip_counts.get("unknown_role", 0) + 1
+                    trace.append({"skip": "unknown_role", "orderRef": order_ref, "role": role})
                     continue
+                inspected += 1
                 matched += 1
                 qty = Decimal(str(ex.shares or 0))
                 px = Decimal(str(price))
@@ -264,13 +280,29 @@ class Command(BaseCommand):
                     "commission": str(total_commission),
                     "net_pnl": str(net_pnl),
                     "executions": matched,
+                    "inspected": inspected,
+                    "trace": trace[:20],
+                    "skips": skip_counts,
                 },
+            )
+            logger.info(
+                "PnL finalize bot=%s cycle=%s matched=%s inspected=%s buys=%s sells=%s commission=%s net=%s skips=%s trace=%s",
+                bot.id,
+                cycle.cycle_key,
+                matched,
+                inspected,
+                total_buys,
+                total_sells,
+                total_commission,
+                net_pnl,
+                skip_counts,
+                trace[:5],
             )
             if matched == 0:
                 log_event(
                     level="WARNING",
                     event_type="PNL_MISSING_EXECUTIONS",
-                    message="No executions matched orderRef prefix during PnL calculation",
+                    message="No executions matched orderRef during PnL calculation",
                     bot=bot,
                     cycle=cycle,
                 )
