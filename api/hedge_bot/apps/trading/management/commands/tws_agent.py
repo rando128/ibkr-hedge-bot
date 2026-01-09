@@ -582,6 +582,28 @@ class Command(BaseCommand):
                 cycle=cycle,
             )
 
+        def get_unrealized_pnl(account: str, conid: int, timeout: float = 2.0) -> Optional[Decimal]:
+            """Best-effort unrealized PnL fetch for recovery guard."""
+            try:
+                sub = ib.reqPnLSingle(account, "", conid)
+            except Exception as exc:
+                logger.warning("PnL guard: reqPnLSingle failed account=%s conId=%s err=%s", account, conid, exc)
+                return None
+            deadline = time.time() + timeout
+            value: Optional[Decimal] = None
+            try:
+                while time.time() < deadline:
+                    if sub.unrealizedPnL is not None:
+                        value = Decimal(str(sub.unrealizedPnL))
+                        break
+                    ib.sleep(0.1)
+            finally:
+                try:
+                    ib.cancelPnLSingle(account, "", conid)
+                except Exception:
+                    pass
+            return value
+
         def reconcile_bot(bot: Bot):
             contract = get_contract(bot)
             ib.qualifyContracts(contract)
@@ -675,6 +697,30 @@ class Command(BaseCommand):
                 if long_trail or short_trail:
                     transition_cycle(cycle, "TRAILING", "Recovered: trailing already active")
                     return
+                # Hedge imbalance: check unrealized PnL to decide between trailing vs panic.
+                if (long_pos > 0 and short_pos == 0) or (short_pos < 0 and long_pos == 0):
+                    surviving_role = "LONG" if long_pos > 0 else "SHORT"
+                    account = bot.long_account if surviving_role == "LONG" else bot.short_account
+                    pnl_val = get_unrealized_pnl(account, contract_conid)
+                    if pnl_val is not None and pnl_val >= Decimal("0"):
+                        transition_cycle(
+                            cycle,
+                            "TRANSITIONING",
+                            f"Recovered imbalance {surviving_role}; unrealized PnL={pnl_val} >= 0 -> trailing",
+                            level="WARNING",
+                        )
+                        missing_sl_role = "SHORT_SL" if surviving_role == "LONG" else "LONG_SL"
+                        cancel_remaining_sl_and_trail(bot, cycle, contract, sl_role=missing_sl_role, min_tick=min_tick)
+                        transition_cycle(cycle, "TRAILING", "Trailing active after recovery PnL guard")
+                        return
+                    log_event(
+                        level="WARNING",
+                        event_type="RECOVERY_PNL_GUARD",
+                        message="Imbalance on recovery: unfavorable or missing unrealized PnL -> panic",
+                        bot=bot,
+                        cycle=cycle,
+                        data={"pnl": str(pnl_val) if pnl_val is not None else None, "surviving": surviving_role},
+                    )
                 # Flat and clean -> abort cycle
                 if long_pos == 0 and short_pos == 0 and not cycle_trades:
                     transition_cycle(cycle, "ABORTED", "Recovered: flat and clean; closing cycle", level="WARNING")
