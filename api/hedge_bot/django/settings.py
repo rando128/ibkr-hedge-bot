@@ -1,7 +1,11 @@
 from importlib import metadata
+import logging.handlers
+from pathlib import Path
 
 from model_w.env_manager import EnvManager
 from model_w.preset.django import ModelWDjango
+
+BASE_DIR = Path(__file__).resolve().parents[2]
 
 # Variables set by the EnvManager but declared here so IDEs don't complain
 DEBUG = False
@@ -32,7 +36,7 @@ with EnvManager(ModelWDjango()) as env:
         "hedge_bot.apps.realtime",
         "procrastinate.contrib.django",
         "hedge_bot.apps.people",
-        #"hedge_bot.apps.health",
+        # "hedge_bot.apps.health",
         "hedge_bot.apps.trading",
     ]
 
@@ -66,11 +70,6 @@ with EnvManager(ModelWDjango()) as env:
         "hedge_bot.django.middleware.RequestLogMiddleware"
     )
 
-    # ---
-    # Admin
-    # ---
-
-    # Increase field limit for Event changelist with many records
     DATA_UPLOAD_MAX_NUMBER_FIELDS = 10000
 
     # ---
@@ -88,7 +87,6 @@ with EnvManager(ModelWDjango()) as env:
         "REDOC_DIST": "SIDECAR",
     }
 
-
     if DEBUG:
         # Django Debug Toolbar
         INSTALLED_APPS.append("debug_toolbar")
@@ -102,3 +100,57 @@ with EnvManager(ModelWDjango()) as env:
 
         # Django Extensions
         INSTALLED_APPS.append("django_extensions")
+
+# ---
+# Final Logging Override
+# ---
+# ---
+# Final Logging Override with Rotation
+# ---
+LOGGING = {
+    'version': 1,
+    'disable_existing_loggers': False,
+    'formatters': {
+        'verbose': {
+            'format': '{levelname} {asctime} [{name}:{funcName}:{lineno}] {message}',
+            'style': '{',
+        },
+    },
+    'handlers': {
+        'agent_file': {
+            'level': 'DEBUG',
+            'class': 'logging.handlers.TimedRotatingFileHandler',
+            'filename': str(BASE_DIR / 'agent.log'),
+            'when': 'M',
+            'interval': 5,
+            'backupCount': 48,
+            'formatter': 'verbose',
+            'encoding': 'utf-8',
+            'delay': True,
+        },
+        'console': {
+            'level': 'DEBUG',
+            'class': 'logging.StreamHandler',
+            'formatter': 'verbose',
+        },
+    },
+    'loggers': {
+        '': {
+            'handlers': ['console', 'agent_file'],
+            'level': 'DEBUG',
+        },
+        'hedge_bot': {
+            'level': 'DEBUG',
+            'handlers': ['console', 'agent_file'],
+            'propagate': False,
+        },
+        'ib_insync': {
+            'level': 'WARNING',
+            'handlers': ['console', 'agent_file'],
+            'propagate': False,
+        },
+    },
+}
+
+import logging.config
+logging.config.dictConfig(LOGGING)

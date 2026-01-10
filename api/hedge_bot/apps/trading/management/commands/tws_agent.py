@@ -17,7 +17,7 @@ from django.utils.asyncio import async_unsafe
 from hedge_bot.apps.trading.models import Bot, Cycle, Event
 
 logger = logging.getLogger(__name__)
-
+logger.info("Starting TWS agent")
 
 ORDERREF_PREFIX = "HB"
 
@@ -113,11 +113,33 @@ class Command(BaseCommand):
             to_state: str = "",
             data: Optional[dict] = None,
         ) -> None:
+            # 1. Map string level to logging constants
+            numeric_level = getattr(logging, level.upper(), logging.INFO)
+
+            # 2. Build Structured Prefix: [BOT:ID][CYC:NUM][STATE:NAME]
+            ctx = []
+            if bot:
+                ctx.append(f"BOT:{bot.id}")
+            if cycle:
+                ctx.append(f"CYC:{cycle.cycle_number}")
+                ctx.append(f"ST:{cycle.state}")
+
+            prefix = f"[{'|'.join(ctx)}]" if ctx else "[SYSTEM]"
+
+            # 3. Comprehensive Logging
+            # This interleaves your logic with the ib_insync logs you saw earlier
+            log_line = f"{prefix} {event_type} | {message}"
+            if data:
+                log_line += f" | DATA: {data}"
+
+            logger.log(numeric_level, log_line)
+
+            # 4. Django DB Persistence
             try:
                 Event.objects.create(
                     bot=bot,
                     cycle=cycle,
-                    level=level,
+                    level=level.upper(),
                     event_type=event_type,
                     message=message,
                     data=data,
@@ -125,7 +147,8 @@ class Command(BaseCommand):
                     to_state=to_state,
                 )
             except Exception:
-                logger.exception("Failed to write Event: %s", message)
+                # Use .exception to capture the DB error traceback in the file
+                logger.exception(f"{prefix} DB_EVENT_FAILURE | Could not save event to database")
 
         def transition_cycle(cycle: Cycle, to_state: str, message: str, *, level: str = "INFO", data: Optional[dict] = None) -> Cycle:
             from_state = cycle.state
@@ -605,6 +628,10 @@ class Command(BaseCommand):
             return value
 
         def reconcile_bot(bot: Bot):
+            logger.info(
+                f"[BOT:{bot.id}][{bot.symbol}] Reconciling bot (Status: {bot.status}, Environment: {bot.environment})"
+            )
+
             contract = get_contract(bot)
             ib.qualifyContracts(contract)
             details = ib.reqContractDetails(contract)
@@ -930,7 +957,7 @@ class Command(BaseCommand):
         ib.errorEvent += on_error
         ib.execDetailsEvent += on_exec_details
 
-        self.stdout.write(self.style.NOTICE(f"[TWS_AGENT] Connecting to {host}:{port} (env={environment}) clientId={client_id}"))
+        logger.info(f"[TWS_AGENT] Connecting to {host}:{port} (env={environment}) clientId={client_id}")
         ib.connect(host, port, clientId=client_id, timeout=10)
         mark_cycles_recovering()
         request_snapshots()
