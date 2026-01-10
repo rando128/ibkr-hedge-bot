@@ -122,7 +122,7 @@ LOGGING = {
             'class': 'logging.handlers.TimedRotatingFileHandler',
             'filename': str(BASE_DIR / 'agent.log'),
             'when': 'M',
-            'interval': 5,
+            'interval': 30,
             'backupCount': 48,
             'formatter': 'verbose',
             'encoding': 'utf-8',
