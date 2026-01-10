@@ -98,6 +98,8 @@ class Command(BaseCommand):
         reconcile_interval: float = options["reconcile_interval"]
         poll_interval: float = options["poll_interval"]
 
+        connectivity_down = False
+
         ib = IB()
 
         def log_event(
@@ -251,12 +253,22 @@ class Command(BaseCommand):
                     trace.append({"skip": "other_cycle", "orderRef": order_ref})
                     continue
                 role = parsed.role.upper()
-                # Accept only known roles
-                if role not in {"LONG_ENTRY", "SHORT_ENTRY", "LONG_SL", "SHORT_SL", "LONG_TRAIL", "SHORT_TRAIL",
-                                "PANIC_DUP073404", "PANIC_DUP073403"}:
+
+                # Define standard roles
+                standard_roles = {
+                    "LONG_ENTRY", "SHORT_ENTRY",
+                    "LONG_SL", "SHORT_SL",
+                    "LONG_TRAIL", "SHORT_TRAIL"
+                }
+
+                # Accept if it's a standard role OR if it's any PANIC order
+                is_valid_role = role in standard_roles or role.startswith("PANIC_")
+
+                if not is_valid_role:
                     skip_counts["unknown_role"] = skip_counts.get("unknown_role", 0) + 1
                     trace.append({"skip": "unknown_role", "orderRef": order_ref, "role": role})
                     continue
+
                 inspected += 1
                 matched += 1
                 qty = Decimal(str(ex.shares or 0))
@@ -967,45 +979,48 @@ class Command(BaseCommand):
         ib.errorEvent += on_error
         ib.execDetailsEvent += on_exec_details
 
-        logger.info(f"[TWS_AGENT] Connecting to {host}:{port} (env={environment}) clientId={client_id}")
+        # Connection and Initial Sync
+        logger.info(f"[TWS_AGENT] Connecting to {host}:{port}...")
         ib.connect(host, port, clientId=client_id, timeout=10)
-        mark_cycles_recovering()
 
-        # Initial snapshot to populate cache
+        # ONE-TIME SNAPSHOT: Populate the local cache at startup
+        logger.info("Performing initial state synchronization...")
         ib.reqPositions()
         ib.reqAllOpenOrders()
-        ib.sleep(1.0)
+        ib.sleep(2.0)  # Give TWS time to send the initial dump
 
+        mark_cycles_recovering()
         last_reconcile_by_bot: dict[int, float] = {}
 
         try:
             while True:
-                # GLOBAL SYNC POINT (Optimization: One request for all bots)
-                ib.reqPositions()
-                ib.reqAllOpenOrders()
+                # NO reqPositions() here!
+                # ib_insync updates ib.positions() automatically in the background.
 
-                # Process IB messages + run DB polling.
+                # This call processes any incoming "pushes" from TWS
                 ib.sleep(poll_interval)
 
                 now = time.time()
-                bots = Bot.objects.filter(environment=environment,
-                                          status__in=("RUNNING", "STOPPING", "ERROR")).order_by("id")
-                active_ids = set()
+                bots = Bot.objects.filter(
+                    environment=environment,
+                    status__in=("RUNNING", "STOPPING", "ERROR")
+                ).order_by("id")
+
+                active_ids = {bot.id for bot in bots}
                 for bot in bots:
-                    active_ids.add(bot.id)
-                    last_run = last_reconcile_by_bot.get(bot.id, 0.0)
-                    if now - last_run < reconcile_interval and last_run > 0:
+                    # Only reconcile if the interval has passed
+                    if now - last_reconcile_by_bot.get(bot.id, 0.0) < reconcile_interval:
                         continue
+
                     try:
                         reconcile_bot(bot)
                     except Exception as exc:
-                        logger.exception("reconcile_bot failed for bot=%s: %s", bot.id, exc)
-                        bot.last_error = str(exc)
-                        bot.status = "ERROR"
-                        bot.save(update_fields=["last_error", "status"])
-                        log_event(level="ERROR", event_type="BOT_ERROR", message=str(exc), bot=bot)
+                        logger.exception(f"reconcile_bot failed for bot={bot.id}")
+                        bot.status, bot.last_error = "ERROR", str(exc)
+                        bot.save()
                     finally:
                         last_reconcile_by_bot[bot.id] = now
+
                 # Prune stale entries
                 for bid in list(last_reconcile_by_bot.keys()):
                     if bid not in active_ids:
