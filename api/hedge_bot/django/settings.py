@@ -120,7 +120,7 @@ LOGGING = {
         'agent_file': {
             'level': 'DEBUG',
             'class': 'logging.handlers.TimedRotatingFileHandler',
-            'filename': str(BASE_DIR / 'agent.log'),
+            'filename': str(BASE_DIR / 'logs/agent.log'),
             'when': 'M',
             'interval': 30,
             'backupCount': 48,
