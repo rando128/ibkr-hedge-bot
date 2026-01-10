@@ -145,7 +145,7 @@ LOGGING = {
             'propagate': False,
         },
         'ib_insync': {
-            'level': 'WARNING',
+            'level': 'INFO',
             'handlers': ['console', 'agent_file'],
             'propagate': False,
         },

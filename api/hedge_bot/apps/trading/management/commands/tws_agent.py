@@ -12,7 +12,6 @@ from django.core.management.base import BaseCommand
 from django.db import transaction
 from django.db.models import Max
 from django.utils import timezone
-from django.utils.asyncio import async_unsafe
 
 from hedge_bot.apps.trading.models import Bot, Cycle, Event
 
@@ -100,7 +99,6 @@ class Command(BaseCommand):
         poll_interval: float = options["poll_interval"]
 
         ib = IB()
-        connectivity_down = False
 
         def log_event(
             *,
@@ -113,28 +111,20 @@ class Command(BaseCommand):
             to_state: str = "",
             data: Optional[dict] = None,
         ) -> None:
-            # 1. Map string level to logging constants
+            # Audit trail improvement: Unified logs
             numeric_level = getattr(logging, level.upper(), logging.INFO)
-
-            # 2. Build Structured Prefix: [BOT:ID][CYC:NUM][STATE:NAME]
             ctx = []
-            if bot:
-                ctx.append(f"BOT:{bot.id}")
+            if bot: ctx.append(f"BOT:{bot.id}")
             if cycle:
                 ctx.append(f"CYC:{cycle.cycle_number}")
                 ctx.append(f"ST:{cycle.state}")
 
             prefix = f"[{'|'.join(ctx)}]" if ctx else "[SYSTEM]"
-
-            # 3. Comprehensive Logging
-            # This interleaves your logic with the ib_insync logs you saw earlier
             log_line = f"{prefix} {event_type} | {message}"
-            if data:
-                log_line += f" | DATA: {data}"
+            if data: log_line += f" | DATA: {data}"
 
             logger.log(numeric_level, log_line)
 
-            # 4. Django DB Persistence
             try:
                 Event.objects.create(
                     bot=bot,
@@ -147,10 +137,10 @@ class Command(BaseCommand):
                     to_state=to_state,
                 )
             except Exception:
-                # Use .exception to capture the DB error traceback in the file
                 logger.exception(f"{prefix} DB_EVENT_FAILURE | Could not save event to database")
 
-        def transition_cycle(cycle: Cycle, to_state: str, message: str, *, level: str = "INFO", data: Optional[dict] = None) -> Cycle:
+        def transition_cycle(cycle: Cycle, to_state: str, message: str, *, level: str = "INFO",
+                             data: Optional[dict] = None) -> Cycle:
             from_state = cycle.state
             if from_state == to_state:
                 return cycle
@@ -183,7 +173,8 @@ class Command(BaseCommand):
                     state="INITIALIZING",
                     last_activity_at=timezone.now(),
                 )
-            log_event(level="INFO", event_type="CYCLE_START", message=f"Cycle {cycle.cycle_number} created", bot=bot, cycle=cycle)
+            log_event(level="INFO", event_type="CYCLE_START", message=f"Cycle {cycle.cycle_number} created", bot=bot,
+                      cycle=cycle)
             return cycle
 
         def get_contract(bot: Bot):
@@ -199,15 +190,10 @@ class Command(BaseCommand):
                     return fn()
                 except Exception as exc:
                     last_exc = exc
-                    delay = base_delay * (2**attempt)
+                    delay = base_delay * (2 ** attempt)
                     logger.warning("%s failed (attempt %s/%s): %s", action, attempt + 1, attempts, exc)
                     ib.sleep(delay)
             raise last_exc  # type: ignore[misc]
-
-        def request_snapshots():
-            ib.reqPositions()
-            ib.reqAllOpenOrders()
-            ib.sleep(0.5)
 
         def finalize_pnl(bot: Bot, cycle: Cycle):
             from ib_insync import ExecutionFilter
@@ -266,7 +252,8 @@ class Command(BaseCommand):
                     continue
                 role = parsed.role.upper()
                 # Accept only known roles
-                if role not in {"LONG_ENTRY", "SHORT_ENTRY", "LONG_SL", "SHORT_SL", "LONG_TRAIL", "SHORT_TRAIL", "PANIC_DUP073404", "PANIC_DUP073403"}:
+                if role not in {"LONG_ENTRY", "SHORT_ENTRY", "LONG_SL", "SHORT_SL", "LONG_TRAIL", "SHORT_TRAIL",
+                                "PANIC_DUP073404", "PANIC_DUP073403"}:
                     skip_counts["unknown_role"] = skip_counts.get("unknown_role", 0) + 1
                     trace.append({"skip": "unknown_role", "orderRef": order_ref, "role": role})
                     continue
@@ -289,7 +276,8 @@ class Command(BaseCommand):
             cycle.net_pnl = net_pnl
             cycle.completed_at = timezone.now()
             cycle.save(
-                update_fields=["total_buys", "total_sells", "total_commission", "net_pnl", "completed_at", "state", "last_activity_at"]
+                update_fields=["total_buys", "total_sells", "total_commission", "net_pnl", "completed_at", "state",
+                               "last_activity_at"]
             )
             log_event(
                 level="INFO",
@@ -333,29 +321,33 @@ class Command(BaseCommand):
                 bot.status = "STOPPED"
                 bot.stopped_at = timezone.now()
                 bot.save(update_fields=["status", "stopped_at"])
-                log_event(level="INFO", event_type="BOT_STOPPED", message="Bot stopped after cycle completion", bot=bot, cycle=cycle)
+                log_event(level="INFO", event_type="BOT_STOPPED", message="Bot stopped after cycle completion", bot=bot,
+                          cycle=cycle)
 
         def mark_cycles_recovering():
             """On agent start, mark in-flight cycles as RECOVERING for fresh reconciliation."""
             candidates = Cycle.objects.filter(
                 bot__status__in=("RUNNING", "STOPPING"),
-                state__in=("INITIALIZING", "ENTERING", "ACTIVE", "TRANSITIONING", "TRAILING", "PNL_CALCULATION", "RECOVERING"),
+                state__in=("INITIALIZING", "ENTERING", "ACTIVE", "TRANSITIONING", "TRAILING", "PNL_CALCULATION",
+                           "RECOVERING"),
             )
             for cycle in candidates:
                 transition_cycle(cycle, "RECOVERING", "Agent restart: entering RECOVERING")
 
         def open_trades_for_cycle(contract_conid: int, bot: Bot, cycle: Cycle):
+            """Optimization: Uses local ib.openTrades() cache."""
             prefix = f"{ORDERREF_PREFIX}:{bot.id}:{cycle.cycle_key}:"
             trades = [
                 t
                 for t in ib.openTrades()
                 if t.contract.conId == contract_conid
-                and t.order.account in (bot.long_account, bot.short_account)
-                and (getattr(t.order, "orderRef", "") or "").startswith(prefix)
+                   and t.order.account in (bot.long_account, bot.short_account)
+                   and (getattr(t.order, "orderRef", "") or "").startswith(prefix)
             ]
             return trades
 
         def find_open_trade_by_role(contract_conid: int, bot: Bot, cycle: Cycle, role: str):
+            """Optimization: Uses local ib.openTrades() cache."""
             target = build_order_ref(bot.id, str(cycle.cycle_key), role)
             for t in ib.openTrades():
                 if t.contract.conId != contract_conid:
@@ -367,12 +359,14 @@ class Command(BaseCommand):
             return None
 
         def get_position_qty(contract_conid: int, account: str) -> Decimal:
+            """Optimization: Uses local ib.positions() cache."""
             for p in ib.positions():
                 if p.contract.conId == contract_conid and p.account == account:
                     return Decimal(str(p.position or 0))
             return Decimal("0")
 
         def get_position_avg_cost(contract_conid: int, account: str) -> Optional[Decimal]:
+            """Optimization: Uses local ib.positions() cache."""
             for p in ib.positions():
                 if p.contract.conId == contract_conid and p.account == account and p.position:
                     return Decimal(str(p.avgCost))
@@ -384,7 +378,7 @@ class Command(BaseCommand):
             This is idempotent and safe to run frequently.
             Avoids cancel/replace races by skipping if the existing SL is still pending submit.
             """
-            request_snapshots()
+            # request_snapshots() REMOVED (Optimization: uses loop-level cache)
             contract_conid = contract.conId
             primary_exch = bot.primary_exchange or getattr(contract, "primaryExchange", "") or bot.exchange
 
@@ -502,13 +496,14 @@ class Command(BaseCommand):
             ]
             for o in orders:
                 with_retries(lambda o=o: ib.placeOrder(contract, o), action=f"place {o.orderRef}")
-            log_event(level="INFO", event_type="ENTRIES_SUBMITTED", message="Submitted long+short entries", bot=bot, cycle=cycle)
+            log_event(level="INFO", event_type="ENTRIES_SUBMITTED", message="Submitted long+short entries", bot=bot,
+                      cycle=cycle)
             cycle.last_activity_at = timezone.now()
             cycle.save(update_fields=["last_activity_at"])
 
         def place_trailing(bot: Bot, cycle: Cycle, contract, surviving_role: str, min_tick: float):
+            # request_snapshots() REMOVED (Optimization: uses loop-level cache)
             contract_conid = contract.conId
-            request_snapshots()
 
             if surviving_role == "LONG":
                 account = bot.long_account
@@ -575,7 +570,7 @@ class Command(BaseCommand):
             place_trailing(bot, cycle, contract, surviving_role=surviving, min_tick=min_tick)
 
         def panic_flatten(bot: Bot, cycle: Optional[Cycle], contract):
-            request_snapshots()
+            # request_snapshots() REMOVED (Optimization: uses loop-level cache)
             contract_conid = contract.conId
             # Cancel all open trades for bot/accounts on this contract (regardless of cycle)
             for t in list(ib.openTrades()):
@@ -585,7 +580,6 @@ class Command(BaseCommand):
                     continue
                 with_retries(lambda t=t: ib.cancelOrder(t.order), action=f"cancel order {t.order.orderId}")
 
-            request_snapshots()
             # Flatten positions on both accounts
             for account in (bot.long_account, bot.short_account):
                 qty = get_position_qty(contract_conid, account)
@@ -648,8 +642,8 @@ class Command(BaseCommand):
                     bot.status = "STOPPING"
                     bot.stopped_at = timezone.now()
                 bot.save(update_fields=["status", "stopped_at", "panic_requested"])
-                # If we are in STOPPING, and now flat/clean, mark STOPPED
-                request_snapshots()
+
+                # Check current state from cache
                 long_pos = get_position_qty(contract.conId, bot.long_account)
                 short_pos = get_position_qty(contract.conId, bot.short_account)
                 open_trades_for_bot = [
@@ -661,12 +655,14 @@ class Command(BaseCommand):
                         transition_cycle(cycle, "ABORTED", "Cycle closed after panic cleanup", level="WARNING")
                         cycle.completed_at = timezone.now()
                         cycle.save(update_fields=["completed_at"])
-                        log_event(level="INFO", event_type="CYCLE_COMPLETE", message="Cycle aborted after panic", bot=bot, cycle=cycle)
+                        log_event(level="INFO", event_type="CYCLE_COMPLETE", message="Cycle aborted after panic",
+                                  bot=bot, cycle=cycle)
                     if bot.status != "STOPPED":
                         bot.status = "STOPPED"
                         bot.stopped_at = timezone.now()
                         bot.save(update_fields=["status", "stopped_at"])
-                        log_event(level="INFO", event_type="BOT_STOPPED", message="Bot stopped after panic cleanup", bot=bot, cycle=cycle)
+                        log_event(level="INFO", event_type="BOT_STOPPED", message="Bot stopped after panic cleanup",
+                                  bot=bot, cycle=cycle)
                 return
 
             if bot.status == "STOPPED":
@@ -681,18 +677,19 @@ class Command(BaseCommand):
             if not cycle:
                 # If we're STOPPING and fully flat/clean, mark STOPPED
                 if bot.status == "STOPPING":
-                    request_snapshots()
                     long_pos = get_position_qty(contract.conId, bot.long_account)
                     short_pos = get_position_qty(contract.conId, bot.short_account)
                     open_trades_for_bot = [
                         t for t in ib.openTrades()
-                        if t.contract.conId == contract.conId and t.order.account in (bot.long_account, bot.short_account)
+                        if
+                        t.contract.conId == contract.conId and t.order.account in (bot.long_account, bot.short_account)
                     ]
                     if long_pos == 0 and short_pos == 0 and not open_trades_for_bot:
                         bot.status = "STOPPED"
                         bot.stopped_at = timezone.now()
                         bot.save(update_fields=["status", "stopped_at"])
-                        log_event(level="INFO", event_type="BOT_STOPPED", message="Bot stopped (no active cycle; flat/clean)", bot=bot)
+                        log_event(level="INFO", event_type="BOT_STOPPED",
+                                  message="Bot stopped (no active cycle; flat/clean)", bot=bot)
                 return
 
             # Safety timer: only applies in hedge activation states.
@@ -703,7 +700,7 @@ class Command(BaseCommand):
                     panic_flatten(bot, cycle, contract)
                     return
 
-            request_snapshots()
+            # Cache check (Optimization)
             contract_conid = contract.conId
 
             long_pos = get_position_qty(contract_conid, bot.long_account)
@@ -721,11 +718,13 @@ class Command(BaseCommand):
                         transition_cycle(cycle, "ABORTED", "Bot stopping: flat/clean; closing cycle", level="WARNING")
                         cycle.completed_at = timezone.now()
                         cycle.save(update_fields=["completed_at"])
-                        log_event(level="INFO", event_type="CYCLE_COMPLETE", message="Cycle aborted/cleaned", bot=bot, cycle=cycle)
+                        log_event(level="INFO", event_type="CYCLE_COMPLETE", message="Cycle aborted/cleaned", bot=bot,
+                                  cycle=cycle)
                     bot.status = "STOPPED"
                     bot.stopped_at = timezone.now()
                     bot.save(update_fields=["status", "stopped_at"])
-                    log_event(level="INFO", event_type="BOT_STOPPED", message="Bot stopped (flat/clean during STOPPING)", bot=bot, cycle=cycle)
+                    log_event(level="INFO", event_type="BOT_STOPPED",
+                              message="Bot stopped (flat/clean during STOPPING)", bot=bot, cycle=cycle)
                     return
 
             long_sl = find_open_trade_by_role(contract_conid, bot, cycle, "LONG_SL")
@@ -772,10 +771,12 @@ class Command(BaseCommand):
                     transition_cycle(cycle, "ABORTED", "Recovered: flat and clean; closing cycle", level="WARNING")
                     cycle.completed_at = timezone.now()
                     cycle.save(update_fields=["completed_at"])
-                    log_event(level="INFO", event_type="CYCLE_COMPLETE", message="Cycle aborted/cleaned", bot=bot, cycle=cycle)
+                    log_event(level="INFO", event_type="CYCLE_COMPLETE", message="Cycle aborted/cleaned", bot=bot,
+                              cycle=cycle)
                     return
                 # Hedge imbalance or missing protections -> panic
-                transition_cycle(cycle, "PANIC", "Recovered: hedge incomplete or protections missing; panic", level="CRITICAL")
+                transition_cycle(cycle, "PANIC", "Recovered: hedge incomplete or protections missing; panic",
+                                 level="CRITICAL")
                 try:
                     panic_flatten(bot, cycle, contract)
                 except Exception as exc:
@@ -804,7 +805,8 @@ class Command(BaseCommand):
                             cycle=cycle,
                         )
                     else:
-                        transition_cycle(cycle, "PANIC", "Hedge imbalance detected (one leg missing); panic/flatten", level="CRITICAL")
+                        transition_cycle(cycle, "PANIC", "Hedge imbalance detected (one leg missing); panic/flatten",
+                                         level="CRITICAL")
                         panic_flatten(bot, cycle, contract)
                         return
 
@@ -815,13 +817,15 @@ class Command(BaseCommand):
                     transition_cycle(cycle, "ABORTED", "Cycle closed after panic/error cleanup", level="WARNING")
                     cycle.completed_at = timezone.now()
                     cycle.save(update_fields=["completed_at"])
-                    log_event(level="INFO", event_type="CYCLE_COMPLETE", message="Cycle aborted/cleaned", bot=bot, cycle=cycle)
+                    log_event(level="INFO", event_type="CYCLE_COMPLETE", message="Cycle aborted/cleaned", bot=bot,
+                              cycle=cycle)
                     cycle = None
                     if bot.status == "STOPPING":
                         bot.status = "STOPPED"
                         bot.stopped_at = timezone.now()
                         bot.save(update_fields=["status", "stopped_at"])
-                        log_event(level="INFO", event_type="BOT_STOPPED", message="Bot stopped after cycle cleanup", bot=bot)
+                        log_event(level="INFO", event_type="BOT_STOPPED", message="Bot stopped after cycle cleanup",
+                                  bot=bot)
                         return
                     # Will create a fresh cycle below if bot remains RUNNING
 
@@ -850,7 +854,9 @@ class Command(BaseCommand):
                 if (long_pos == 0) != (short_pos == 0):
                     surviving = "LONG" if long_pos > 0 else "SHORT"
                     transition_cycle(cycle, "TRANSITIONING", "Hedge leg missing; flipping surviving leg to trailing")
-                    cancel_remaining_sl_and_trail(bot, cycle, contract, sl_role="SHORT_SL" if surviving == "LONG" else "LONG_SL", min_tick=min_tick)
+                    cancel_remaining_sl_and_trail(bot, cycle, contract,
+                                                  sl_role="SHORT_SL" if surviving == "LONG" else "LONG_SL",
+                                                  min_tick=min_tick)
                     transition_cycle(cycle, "TRAILING", "Trailing active after imbalance flip")
                     return
                 # Keep SL qty aligned to positions (partial fills)
@@ -876,11 +882,13 @@ class Command(BaseCommand):
                 # Completion condition: both accounts flat and no open orders for this cycle.
                 cycle_trades = open_trades_for_cycle(contract_conid, bot, cycle)
                 if long_pos == 0 and short_pos == 0:
-                    if cycle_trades:
-                        # Clean up any straggling orders tied to this cycle.
+                    if not cycle_trades:
+                        transition_cycle(cycle, "PNL_CALCULATION", "Positions flat; calculating P&L")
+                    else:
+                        # Clean up any straggling orders tied to this cycle before moving to PnL
                         for t in cycle_trades:
-                            with_retries(lambda t=t: ib.cancelOrder(t.order), action=f"cancel stray order {t.order.orderId}")
-                    transition_cycle(cycle, "PNL_CALCULATION", "Positions flat; calculating P&L")
+                            with_retries(lambda t=t: ib.cancelOrder(t.order),
+                                         action=f"cancel stray order {t.order.orderId}")
                 return
 
             if cycle.state == "PNL_CALCULATION":
@@ -918,12 +926,14 @@ class Command(BaseCommand):
                 details = ib.reqContractDetails(contract)
                 min_tick = float(details[0].minTick) if details else 0.01
                 ensure_sl_orders(bot, cycle, contract, min_tick=min_tick)
-                request_snapshots()
+
+                # Manual state check on fill (uses local cache)
                 long_pos = get_position_qty(contract.conId, bot.long_account)
                 short_pos = get_position_qty(contract.conId, bot.short_account)
                 long_sl = find_open_trade_by_role(contract.conId, bot, cycle, "LONG_SL")
                 short_sl = find_open_trade_by_role(contract.conId, bot, cycle, "SHORT_SL")
-                if cycle.state in ("INITIALIZING", "ENTERING") and long_pos > 0 and short_pos < 0 and long_sl and short_sl:
+                if cycle.state in ("INITIALIZING",
+                                   "ENTERING") and long_pos > 0 and short_pos < 0 and long_sl and short_sl:
                     transition_cycle(cycle, "ACTIVE", "Both SL protections confirmed after entry fill")
                 return
 
@@ -960,17 +970,26 @@ class Command(BaseCommand):
         logger.info(f"[TWS_AGENT] Connecting to {host}:{port} (env={environment}) clientId={client_id}")
         ib.connect(host, port, clientId=client_id, timeout=10)
         mark_cycles_recovering()
-        request_snapshots()
+
+        # Initial snapshot to populate cache
+        ib.reqPositions()
+        ib.reqAllOpenOrders()
+        ib.sleep(1.0)
 
         last_reconcile_by_bot: dict[int, float] = {}
 
         try:
             while True:
+                # GLOBAL SYNC POINT (Optimization: One request for all bots)
+                ib.reqPositions()
+                ib.reqAllOpenOrders()
+
                 # Process IB messages + run DB polling.
                 ib.sleep(poll_interval)
 
                 now = time.time()
-                bots = Bot.objects.filter(environment=environment, status__in=("RUNNING", "STOPPING", "ERROR")).order_by("id")
+                bots = Bot.objects.filter(environment=environment,
+                                          status__in=("RUNNING", "STOPPING", "ERROR")).order_by("id")
                 active_ids = set()
                 for bot in bots:
                     active_ids.add(bot.id)
