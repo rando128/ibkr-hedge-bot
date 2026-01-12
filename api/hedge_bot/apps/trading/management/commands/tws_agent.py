@@ -381,9 +381,18 @@ class Command(BaseCommand):
                     return
 
             long_pos, short_pos = get_position_qty(conid, bot.long_account), get_position_qty(conid, bot.short_account)
+            open_trades = open_trades_for_cycle(conid, bot, cycle)
+
+            if cycle.state == "PANIC":
+                if long_pos == 0 and short_pos == 0 and not open_trades:
+                    transition_cycle(cycle, "ABORTED", "Panic flatten complete; marking aborted", level="WARNING")
+                    if bot.status == "STOPPING":
+                        bot.status = "STOPPED"
+                        bot.stopped_at = timezone.now()
+                        bot.save(update_fields=["status", "stopped_at"])
+                return
 
             if cycle.state == "RECOVERING":
-                cycle_trades = open_trades_for_cycle(conid, bot, cycle)
                 if long_pos > 0 and short_pos < 0 and find_open_trade_by_role(conid, bot, cycle,
                                                                               "LONG_SL") and find_open_trade_by_role(
                     conid, bot, cycle, "SHORT_SL"):
@@ -392,7 +401,7 @@ class Command(BaseCommand):
                                                                                                          cycle,
                                                                                                          "SHORT_TRAIL"):
                     transition_cycle(cycle, "TRAILING", "Recovered: trailing")
-                elif long_pos == 0 and short_pos == 0 and not cycle_trades:
+                elif long_pos == 0 and short_pos == 0 and not open_trades:
                     transition_cycle(cycle, "ABORTED", "Recovered: flat")
                 else:
                     # If imbalance on recovery, check unrealized PnL
