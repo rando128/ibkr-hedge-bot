@@ -4,6 +4,7 @@ import logging
 import math
 import time
 import threading
+import contextlib
 from dataclasses import dataclass
 from decimal import Decimal
 from typing import Optional
@@ -257,6 +258,25 @@ class Command(BaseCommand):
                     return t
             return None
 
+        def get_unrealized_pnl(account: str, conid: int) -> Optional[Decimal]:
+            """
+            Conservative unrealized PnL using IB position cache; falls back to 0 if data missing.
+            We avoid market data; best-effort heuristic to keep recovery logic running.
+            """
+            for p in ib.positions():
+                if p.account == account and p.contract.conId == conid:
+                    qty = Decimal(str(p.position or 0))
+                    if qty == 0:
+                        return Decimal("0")
+                    avg_cost = Decimal(str(p.avgCost))
+                    # If last price not available, treat PnL as flat (0) to avoid panicking.
+                    last = getattr(p, "marketPrice", None)
+                    if last is None:
+                        return Decimal("0")
+                    last_px = Decimal(str(last))
+                    return (last_px - avg_cost) * qty
+            return Decimal("0")
+
         def get_position_qty(contract_conid, account):
             # Uses ib_insync local cache (Optimization)
             for p in ib.positions():
@@ -502,32 +522,49 @@ class Command(BaseCommand):
             logger.warning("IB error %s: %s", errorCode, errorString)
 
         def _process_exec_details(trade, fill):
-            order_ref = ""
-            if trade and getattr(trade, "order", None):
-                order_ref = getattr(trade.order, "orderRef", "") or ""
-            if not order_ref and fill and getattr(fill, "execution", None):
-                order_ref = getattr(fill.execution, "orderRef", "") or ""
-            parsed = parse_order_ref(order_ref)
-            if not parsed or not parsed.role.upper().endswith("_SL"):
-                return
+            """
+            Handle SL fills in real time so we flip to trailing immediately.
+            """
+            try:
+                order_ref = ""
+                if trade and getattr(trade, "order", None):
+                    order_ref = getattr(trade.order, "orderRef", "") or ""
+                if not order_ref and fill and getattr(fill, "execution", None):
+                    order_ref = getattr(fill.execution, "orderRef", "") or ""
+                parsed = parse_order_ref(order_ref)
+                if not parsed or not parsed.role.upper().endswith("_SL"):
+                    return
 
-            bot = Bot.objects.filter(pk=parsed.bot_id).first()
-            if not bot:
-                return
-            cycle = bot.cycles.filter(cycle_key=parsed.cycle_key).first()
-            if not cycle or cycle.state in ("PANIC", "COMPLETED", "ABORTED"):
-                return
+                bot = Bot.objects.filter(pk=parsed.bot_id).first()
+                if not bot:
+                    return
+                cycle = bot.cycles.filter(cycle_key=parsed.cycle_key).first()
+                if not cycle or cycle.state in ("PANIC", "COMPLETED", "ABORTED"):
+                    return
 
-            contract = trade.contract if trade else None
-            if not contract:
-                return
-            details = ib.reqContractDetails(contract)
-            min_tick = float(details[0].minTick) if details else 0.01
+                # Fallback to the contract carried by the fill if trade is missing
+                contract = None
+                if trade and getattr(trade, "contract", None):
+                    contract = trade.contract
+                elif fill and getattr(fill, "contract", None):
+                    contract = fill.contract
+                if not contract:
+                    logger.warning("[BOT:%s] SL fill without contract; skipping trailing flip", bot.id)
+                    return
 
-            sl_role = parsed.role.upper()
-            transition_cycle(cycle, "TRANSITIONING", f"{sl_role} filled -> flip to trailing", level="WARNING")
-            cancel_remaining_sl_and_trail(bot, cycle, contract, sl_role=sl_role, min_tick=min_tick)
-            transition_cycle(cycle, "TRAILING", "Trailing active after SL fill")
+                details = ib.reqContractDetails(contract)
+                min_tick = float(details[0].minTick) if details else 0.01
+
+                # Refresh positions cache so ACTIVE reconcile does not re-arm SLs right after a fill
+                with contextlib.suppress(Exception):
+                    ib.reqPositions()
+
+                sl_role = parsed.role.upper()
+                transition_cycle(cycle, "TRANSITIONING", f"{sl_role} filled -> flip to trailing", level="WARNING")
+                cancel_remaining_sl_and_trail(bot, cycle, contract, sl_role=sl_role, min_tick=min_tick)
+                transition_cycle(cycle, "TRAILING", "Trailing active after SL fill")
+            except Exception:
+                logger.exception("_process_exec_details failed")
 
         def on_exec_details(trade, fill):
             try:

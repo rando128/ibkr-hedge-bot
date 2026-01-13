@@ -62,6 +62,7 @@ Access the admin at: http://127.0.0.1:8080/back/admin/
 cd api
 # Environment chooses default port (PAPER→7497, LIVE→7496); override with --port if needed
 poetry run python manage.py tws_agent --environment PAPER
+poetry run python manage.py tws_agent --environment LIVE
 ```
 
 #### 3. Start the Procrastinate Worker (monitor queue only)
