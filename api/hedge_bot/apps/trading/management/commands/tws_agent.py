@@ -82,7 +82,7 @@ class Command(BaseCommand):
         parser.add_argument("--host", default="127.0.0.1")
         parser.add_argument("--port", type=int, default=None)
         parser.add_argument("--environment", choices=["PAPER", "LIVE"], default="PAPER")
-        parser.add_argument("--client-id", type=int, default=7000)
+        parser.add_argument("--client-id", type=int, default=None)
         parser.add_argument("--reconcile-interval", type=float, default=10.0)
         parser.add_argument("--poll-interval", type=float, default=0.5)
 
@@ -94,7 +94,7 @@ class Command(BaseCommand):
         host: str = options["host"]
         environment: str = options["environment"]
         port: int = options["port"] or (7497 if environment == "PAPER" else 7496)
-        client_id: int = options["client_id"]
+        client_id: int = options["client_id"] or (7000 if environment == "PAPER" else 8000)
         reconcile_interval: float = options["reconcile_interval"]
         poll_interval: float = options["poll_interval"]
 
@@ -283,8 +283,14 @@ class Command(BaseCommand):
                         tick = tick_for_price(float(avg_cost))
                         if side == 'long':
                             stop_px = q_floor(float(avg_cost) * (1 - float(bot.stop_pct)), tick)
+                            # Keep long SL below entry even if stop_pct misconfigured/negative
+                            if stop_px >= float(avg_cost):
+                                stop_px = q_floor(float(avg_cost) - tick, tick)
                         else:
                             stop_px = q_ceil(float(avg_cost) * (1 + float(bot.stop_pct)), tick)
+                            # Keep short SL above entry even if stop_pct misconfigured/negative
+                            if stop_px <= float(avg_cost):
+                                stop_px = q_ceil(float(avg_cost) + tick, tick)
 
                         role = f"{side.upper()}_SL"
                         existing = find_open_trade_by_role(contract_conid, bot, cycle, role)
@@ -371,7 +377,21 @@ class Command(BaseCommand):
 
             if bot.status in ("STOPPED", "ERROR"): return
             if not cycle and bot.status == "RUNNING": cycle = load_or_create_cycle(bot)
-            if not cycle: return
+            if not cycle:
+                # No active cycle (likely already aborted/completed) — if STOPPING and flat/clean, mark STOPPED.
+                if bot.status == "STOPPING":
+                    long_pos = get_position_qty(conid, bot.long_account)
+                    short_pos = get_position_qty(conid, bot.short_account)
+                    open_bot_trades = [t for t in ib.openTrades() if
+                                       t.contract.conId == conid and t.order.account in (bot.long_account,
+                                                                                          bot.short_account)]
+                    if long_pos == 0 and short_pos == 0 and not open_bot_trades:
+                        bot.status = "STOPPED"
+                        bot.stopped_at = timezone.now()
+                        bot.save(update_fields=["status", "stopped_at"])
+                        log_event(level="INFO", event_type="BOT_STOPPED",
+                                  message="Bot stopped (STOPPING + no active cycle + flat/clean)", bot=bot)
+                return
 
             # Safety timer: only applies in hedge activation states.
             if cycle.state in ("INITIALIZING", "ENTERING"):
@@ -382,6 +402,19 @@ class Command(BaseCommand):
 
             long_pos, short_pos = get_position_qty(conid, bot.long_account), get_position_qty(conid, bot.short_account)
             open_trades = open_trades_for_cycle(conid, bot, cycle)
+            open_bot_trades = [t for t in ib.openTrades() if
+                               t.contract.conId == conid and t.order.account in (bot.long_account, bot.short_account)]
+
+            # If operator requested stop and we're flat/clean, finalize stop regardless of cycle state.
+            if bot.status == "STOPPING" and long_pos == 0 and short_pos == 0 and not open_trades and not open_bot_trades:
+                if cycle and cycle.state not in ("COMPLETED", "ABORTED"):
+                    transition_cycle(cycle, "ABORTED", "STOPPING + flat/clean; closing cycle", level="WARNING")
+                bot.status = "STOPPED"
+                bot.stopped_at = timezone.now()
+                bot.save(update_fields=["status", "stopped_at"])
+                log_event(level="INFO", event_type="BOT_STOPPED", message="Bot stopped (flat/clean in STOPPING)", bot=bot,
+                          cycle=cycle)
+                return
 
             if cycle.state == "PANIC":
                 if long_pos == 0 and short_pos == 0 and not open_trades:
@@ -436,6 +469,22 @@ class Command(BaseCommand):
                                                   "SHORT_SL" if surviving == "LONG" else "LONG_SL", min_tick)
                 else:
                     ensure_sl_orders(bot, cycle, contract, min_tick)
+            elif cycle.state == "TRANSITIONING":
+                long_trail = find_open_trade_by_role(conid, bot, cycle, "LONG_TRAIL")
+                short_trail = find_open_trade_by_role(conid, bot, cycle, "SHORT_TRAIL")
+                if long_trail or short_trail:
+                    transition_cycle(cycle, "TRAILING", "Trailing active after SL fill/flip")
+                else:
+                    # No trailing yet; try to place based on surviving leg.
+                    surviving = None
+                    if long_pos > 0 and short_pos == 0:
+                        surviving = "LONG"
+                    elif short_pos < 0 and long_pos == 0:
+                        surviving = "SHORT"
+                    if surviving:
+                        cancel_remaining_sl_and_trail(bot, cycle, contract,
+                                                      "SHORT_SL" if surviving == "LONG" else "LONG_SL", min_tick)
+                        transition_cycle(cycle, "TRAILING", "Trailing placed from TRANSITIONING")
             elif cycle.state == "TRAILING":
                 if long_pos == 0 and short_pos == 0:
                     if not open_trades_for_cycle(conid, bot, cycle):
@@ -452,7 +501,42 @@ class Command(BaseCommand):
                 connectivity_down = False
             logger.warning("IB error %s: %s", errorCode, errorString)
 
+        def _process_exec_details(trade, fill):
+            order_ref = ""
+            if trade and getattr(trade, "order", None):
+                order_ref = getattr(trade.order, "orderRef", "") or ""
+            if not order_ref and fill and getattr(fill, "execution", None):
+                order_ref = getattr(fill.execution, "orderRef", "") or ""
+            parsed = parse_order_ref(order_ref)
+            if not parsed or not parsed.role.upper().endswith("_SL"):
+                return
+
+            bot = Bot.objects.filter(pk=parsed.bot_id).first()
+            if not bot:
+                return
+            cycle = bot.cycles.filter(cycle_key=parsed.cycle_key).first()
+            if not cycle or cycle.state in ("PANIC", "COMPLETED", "ABORTED"):
+                return
+
+            contract = trade.contract if trade else None
+            if not contract:
+                return
+            details = ib.reqContractDetails(contract)
+            min_tick = float(details[0].minTick) if details else 0.01
+
+            sl_role = parsed.role.upper()
+            transition_cycle(cycle, "TRANSITIONING", f"{sl_role} filled -> flip to trailing", level="WARNING")
+            cancel_remaining_sl_and_trail(bot, cycle, contract, sl_role=sl_role, min_tick=min_tick)
+            transition_cycle(cycle, "TRAILING", "Trailing active after SL fill")
+
+        def on_exec_details(trade, fill):
+            try:
+                threading.Thread(target=_process_exec_details, args=(trade, fill), daemon=True).start()
+            except Exception:
+                logger.exception("on_exec_details failed")
+
         ib.errorEvent += on_error
+        ib.execDetailsEvent += on_exec_details
         ib.connect(host, port, clientId=client_id, timeout=10)
         mark_cycles_recovering()
 
